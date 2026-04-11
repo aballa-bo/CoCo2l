@@ -1,0 +1,95 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="certifi" />
+          <option value="charset-normalizer" />
+          <option value="contourpy" />
+          <option value="cycler" />
+          <option value="diskcache" />
+          <option value="filelock" />
+          <option value="fonttools" />
+          <option value="fsspec" />
+          <option value="idna" />
+          <option value="Jinja2" />
+          <option value="kiwisolver" />
+          <option value="llama_cpp_python" />
+          <option value="MarkupSafe" />
+          <option value="matplotlib" />
+          <option value="mpmath" />
+          <option value="networkx" />
+          <option value="numpy" />
+          <option value="opencv-python" />
+          <option value="packaging" />
+          <option value="pillow" />
+          <option value="polars" />
+          <option value="psutil" />
+          <option value="pyparsing" />
+          <option value="python-dateutil" />
+          <option value="PyYAML" />
+          <option value="requests" />
+          <option value="scipy" />
+          <option value="six" />
+          <option value="sympy" />
+          <option value="torch" />
+          <option value="torchvision" />
+          <option value="typing_extensions" />
+          <option value="ultralytics" />
+          <option value="ultralytics-thop" />
+          <option value="urllib3" />
+          <option value="bm3d" />
+          <option value="bm4d" />
+          <option value="cabarchive" />
+          <option value="cfgv" />
+          <option value="colormath" />
+          <option value="colour-checker-detection" />
+          <option value="colour-science" />
+          <option value="cx_Freeze" />
+          <option value="cx_Logging" />
+          <option value="distlib" />
+          <option value="et_xmlfile" />
+          <option value="ExifRead" />
+          <option value="identify" />
+          <option value="imageio" />
+          <option value="joblib" />
+          <option value="lazy_loader" />
+          <option value="lensfunpy" />
+          <option value="lief" />
+          <option value="lxml" />
+          <option value="memory-profiler" />
+          <option value="nodeenv" />
+          <option value="opencv-python-headless" />
+          <option value="openpyxl" />
+          <option value="pandas" />
+          <option value="patsy" />
+          <option value="platformdirs" />
+          <option value="pre_commit" />
+          <option value="PyExifTool" />
+          <option value="pyfiglet" />
+          <option value="pytz" />
+          <option value="PyWavelets" />
+          <option value="rawpy" />
+          <option value="scikit-image" />
+          <option value="scikit-learn" />
+          <option value="statsmodels" />
+          <option value="striprtf" />
+          <option value="threadpoolctl" />
+          <option value="tifffile" />
+          <option value="tomli" />
+          <option value="tzdata" />
+          <option value="virtualenv" />
+          <option value="pyqt5" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="core.src.shaftless.shaftless_corrector.ShaftLessCorrector" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
