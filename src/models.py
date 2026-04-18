@@ -1,8 +1,9 @@
-"""White-preserving linear and HPPCC models."""
+"""White-preserving linear, RPCC, and HPPCC models."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 
 import numpy as np
 
@@ -138,43 +139,22 @@ def _assign_regions(angles: np.ndarray, boundaries: np.ndarray) -> np.ndarray:
     return np.searchsorted(boundaries, angles, side="right") % len(boundaries)
 
 
-def fit_hppcc(
-    rgb: np.ndarray,
-    xyz: np.ndarray,
-    *,
-    white_index: int,
-    chromatic_indices: np.ndarray | list[int],
-    k_regions: int = 4,
-) -> HPPCCModel:
-    """Fit the 2016 constrained least-squares HPPCC model with fixed equal-count hue regions.
+def _fit_hppcc_constrained(
+    q_sorted: np.ndarray,
+    p_sorted: np.ndarray,
+    boundaries: np.ndarray,
+    region_ids: np.ndarray,
+    white_rgb: np.ndarray,
+    white_xyz: np.ndarray,
+) -> np.ndarray:
+    """Fit K regional 3×3 matrices with boundary-continuity and white-point constraints.
 
-    The model fit uses chromatic training patches to define hue partitions and regional least-squares
-    blocks. The designated white patch enforces white-point preservation globally.
+    Returns matrices of shape (K, 3, 3).
     """
+    k_regions = len(boundaries)
+    n = len(q_sorted)
 
-    rgb = np.asarray(rgb, dtype=np.float64)
-    xyz = np.asarray(xyz, dtype=np.float64)
-    chromatic_indices = np.asarray(chromatic_indices, dtype=int)
-    if rgb.shape != xyz.shape or rgb.shape[1] != 3:
-        raise ValueError("rgb and xyz must both have shape (N, 3).")
-    if len(chromatic_indices) < k_regions:
-        raise ValueError("Not enough chromatic patches for the requested number of regions.")
-
-    q = rgb[chromatic_indices]
-    p = xyz[chromatic_indices]
-    angles = hue_angle_from_rgb(q)
-    boundaries = _equal_count_boundaries(angles, k_regions)
-    order = np.argsort(angles)
-    q_sorted = q[order]
-    p_sorted = p[order]
-    angles_sorted = angles[order]
-    region_ids = _assign_regions(angles_sorted, boundaries)
-
-    counts = np.bincount(region_ids, minlength=k_regions)
-    if np.any(counts == 0):
-        raise ValueError("Equal-count partitioning produced an empty hue region.")
-
-    a = np.zeros((len(q_sorted), 3 * k_regions), dtype=np.float64)
+    a = np.zeros((n, 3 * k_regions), dtype=np.float64)
     for region in range(k_regions):
         mask = region_ids == region
         a[np.ix_(mask, np.arange(3 * region, 3 * (region + 1)))] = q_sorted[mask]
@@ -196,19 +176,233 @@ def fit_hppcc(
     c[k_regions - 1, 3 * (k_regions - 1) : 3 * k_regions] = boundary_samples[-1]
     c[k_regions - 1, 0:3] = -boundary_samples[-1]
 
-    white_rgb = rgb[white_index]
     for region in range(k_regions - 1):
         row = k_regions + region
         c[row, 3 * region : 3 * (region + 1)] = white_rgb
         c[row, 3 * (region + 1) : 3 * (region + 2)] = -white_rgb
 
     c[-1, 0:3] = white_rgb
-    b[-1] = xyz[white_index]
+    b[-1] = white_xyz
+
     t = _solve_constrained_least_squares(a, p_sorted, c, b)
-    matrices = t.reshape(k_regions, 3, 3)
+    return t.reshape(k_regions, 3, 3)
+
+
+def _exhaustive_boundary_search(
+    q_sorted: np.ndarray,
+    p_sorted: np.ndarray,
+    angles_sorted: np.ndarray,
+    k_regions: int,
+    white_rgb: np.ndarray,
+    white_xyz: np.ndarray,
+    min_per_region: int = 1,
+) -> np.ndarray:
+    """Find hue boundaries minimising constrained LS residual via exhaustive split search.
+
+    Evaluates all C(n-1, K-1) ways to partition n sorted chromatic patches into K groups.
+    Falls back to equal-count boundaries if no valid split is found.
+    """
+    n = len(angles_sorted)
+    best_boundaries = _equal_count_boundaries(angles_sorted, k_regions)
+    best_residual = float("inf")
+
+    for split_positions in combinations(range(1, n), k_regions - 1):
+        # Reject trivially if split would leave fewer than min_per_region patches in any region
+        sizes = [split_positions[0]] + [
+            split_positions[i] - split_positions[i - 1] for i in range(1, len(split_positions))
+        ] + [n - split_positions[-1]]
+        if any(s < min_per_region for s in sizes):
+            continue
+
+        bounds = np.zeros(k_regions, dtype=np.float64)
+        bounds[0] = 0.0
+        for i, s in enumerate(split_positions):
+            bounds[i + 1] = 0.5 * (angles_sorted[s - 1] + angles_sorted[s])
+
+        region_ids = _assign_regions(angles_sorted, bounds)
+        counts = np.bincount(region_ids, minlength=k_regions)
+        if np.any(counts < min_per_region):
+            continue
+
+        try:
+            matrices = _fit_hppcc_constrained(q_sorted, p_sorted, bounds, region_ids, white_rgb, white_xyz)
+        except np.linalg.LinAlgError:
+            continue
+
+        residual = sum(
+            float(np.sum((q_sorted[region_ids == r] @ matrices[r] - p_sorted[region_ids == r]) ** 2))
+            for r in range(k_regions)
+        )
+        if residual < best_residual:
+            best_residual = residual
+            best_boundaries = bounds.copy()
+
+    return best_boundaries
+
+
+def fit_hppcc(
+    rgb: np.ndarray,
+    xyz: np.ndarray,
+    *,
+    white_index: int,
+    chromatic_indices: np.ndarray | list[int],
+    k_regions: int = 4,
+    optimize_boundaries: bool = False,
+) -> HPPCCModel:
+    """Fit the 2016 constrained least-squares HPPCC model.
+
+    When optimize_boundaries=True, performs exhaustive search over all C(n-1, K-1) hue
+    partitions to find region boundaries that minimise the constrained LS residual.
+    Otherwise uses equal-count partitioning.
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    chromatic_indices = np.asarray(chromatic_indices, dtype=int)
+    if rgb.shape != xyz.shape or rgb.shape[1] != 3:
+        raise ValueError("rgb and xyz must both have shape (N, 3).")
+    if len(chromatic_indices) < k_regions:
+        raise ValueError("Not enough chromatic patches for the requested number of regions.")
+
+    q = rgb[chromatic_indices]
+    p = xyz[chromatic_indices]
+    angles = hue_angle_from_rgb(q)
+    order = np.argsort(angles)
+    q_sorted = q[order]
+    p_sorted = p[order]
+    angles_sorted = angles[order]
+    white_rgb = rgb[white_index]
+    white_xyz = xyz[white_index]
+
+    if optimize_boundaries:
+        boundaries = _exhaustive_boundary_search(
+            q_sorted, p_sorted, angles_sorted, k_regions, white_rgb, white_xyz,
+            min_per_region=3,
+        )
+    else:
+        boundaries = _equal_count_boundaries(angles_sorted, k_regions)
+
+    region_ids = _assign_regions(angles_sorted, boundaries)
+    counts = np.bincount(region_ids, minlength=k_regions)
+    if np.any(counts == 0):
+        raise ValueError("Hue partitioning produced an empty region.")
+
+    matrices = _fit_hppcc_constrained(q_sorted, p_sorted, boundaries, region_ids, white_rgb, white_xyz)
     return HPPCCModel(
         matrices=matrices,
         boundaries=boundaries,
-        white_rgb=rgb[white_index].copy(),
-        white_xyz=xyz[white_index].copy(),
+        white_rgb=white_rgb.copy(),
+        white_xyz=white_xyz.copy(),
     )
+
+
+@dataclass(frozen=True)
+class HPPCCRPCCModel:
+    """Two-stage pipeline: HPPCC hue-preserving primary + RPCC global residual correction.
+
+    Prediction: xyz = hppcc.predict(rgb) + rpcc_residual.predict(rgb)
+    The RPCC component is trained on xyz residuals (xyz_ref - xyz_hppcc).
+    Because HPPCC preserves the white point exactly, the RPCC residual for the white
+    patch is zero and its white-point constraint is trivially satisfied.
+    """
+
+    hppcc: HPPCCModel
+    rpcc_residual: "RPCCModel"
+
+    @property
+    def boundaries(self) -> np.ndarray:
+        return self.hppcc.boundaries
+
+    @property
+    def matrices(self) -> np.ndarray:
+        return self.hppcc.matrices
+
+    @property
+    def white_rgb(self) -> np.ndarray:
+        return self.hppcc.white_rgb
+
+    @property
+    def white_xyz(self) -> np.ndarray:
+        return self.hppcc.white_xyz
+
+    def predict(self, rgb: np.ndarray) -> np.ndarray:
+        rgb = np.asarray(rgb, dtype=np.float64)
+        return self.hppcc.predict(rgb) + self.rpcc_residual.predict(rgb)
+
+    def predict_blending(self, rgb: np.ndarray, blend_width: float = 0.15) -> np.ndarray:
+        rgb = np.asarray(rgb, dtype=np.float64)
+        return self.hppcc.predict_blending(rgb, blend_width=blend_width) + self.rpcc_residual.predict(rgb)
+
+
+def _rpcc_features(rgb: np.ndarray) -> np.ndarray:
+    """Root-Polynomial feature expansion: [R, G, B, sqrt(RG), sqrt(RB), sqrt(GB)]."""
+    rgb = np.asarray(rgb, dtype=np.float64)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    rg = np.sqrt(np.maximum(r * g, 0.0))
+    rb = np.sqrt(np.maximum(r * b, 0.0))
+    gb = np.sqrt(np.maximum(g * b, 0.0))
+    return np.stack([r, g, b, rg, rb, gb], axis=-1)
+
+
+@dataclass(frozen=True)
+class RPCCModel:
+    """Root-Polynomial Color Correction (Finlayson) with white-point preservation.
+
+    Maps camera RGB → XYZ using a white-constrained 6×3 matrix over the
+    feature vector [R, G, B, √(RG), √(RB), √(GB)].
+    """
+
+    matrix: np.ndarray  # shape (6, 3)
+    white_rgb: np.ndarray
+    white_xyz: np.ndarray
+
+    def predict(self, rgb: np.ndarray) -> np.ndarray:
+        features = _rpcc_features(np.asarray(rgb, dtype=np.float64))
+        return features @ self.matrix
+
+
+def fit_rpcc(rgb: np.ndarray, xyz: np.ndarray, white_index: int) -> RPCCModel:
+    """Fit a white-preserving Root-Polynomial Color Correction matrix.
+
+    Solves: min ||F @ M - XYZ||²  s.t.  F_white @ M = XYZ_white
+    where F is the 6-feature root-polynomial expansion of camera RGB.
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    features = _rpcc_features(rgb)
+    white_features = features[white_index]
+    white_xyz = xyz[white_index].copy()
+    constraint = white_features[np.newaxis, :]
+    matrix = _solve_constrained_least_squares(features, xyz, constraint, white_xyz[np.newaxis, :])
+    return RPCCModel(matrix=matrix, white_rgb=rgb[white_index].copy(), white_xyz=white_xyz)
+
+
+
+def fit_hppcc_rpcc(
+    rgb: np.ndarray,
+    xyz: np.ndarray,
+    *,
+    white_index: int,
+    chromatic_indices: np.ndarray | list[int],
+    k_regions: int = 4,
+    optimize_boundaries: bool = False,
+) -> HPPCCRPCCModel:
+    """Fit the inverted two-stage HPPCC + RPCC model.
+
+    Stage 1 — fit_hppcc: hue-preserving regional mapping rgb → xyz_hppcc.
+    Stage 2 — fit_rpcc on residuals: global root-polynomial correction of (xyz_ref - xyz_hppcc).
+    Because HPPCC preserves the white point exactly, the RPCC residual constraint is zero.
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    hppcc = fit_hppcc(
+        rgb,
+        xyz,
+        white_index=white_index,
+        chromatic_indices=chromatic_indices,
+        k_regions=k_regions,
+        optimize_boundaries=optimize_boundaries,
+    )
+    xyz_hppcc = hppcc.predict(rgb)
+    xyz_residual = xyz - xyz_hppcc
+    rpcc_residual = fit_rpcc(rgb, xyz_residual, white_index=white_index)
+    return HPPCCRPCCModel(hppcc=hppcc, rpcc_residual=rpcc_residual)

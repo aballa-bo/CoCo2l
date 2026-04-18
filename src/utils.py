@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from PIL import ImageCms
 
-from .models import HPPCCModel, LinearWhitePreservingModel
+from .models import HPPCCModel, HPPCCRPCCModel, LinearWhitePreservingModel, RPCCModel
 
 
 BRADFORD_MATRIX = np.array(
@@ -49,6 +49,80 @@ ICC_PROFILE_CANDIDATES = {
         SYSTEM_COLOR_PROFILE_DIR / "DCI-P3-D65.icc",
     ],
 }
+
+
+def estimate_scene_white_from_neutral_patches(
+    normalized_rgb: np.ndarray,
+    neutral_indices: np.ndarray,
+    daylight_wb: tuple,
+    reference_white: np.ndarray,
+    min_value: float = 0.01,
+) -> np.ndarray:
+    """Estimate scene illuminant XYZ from the r/g and b/g ratios of neutral patches.
+
+    For any achromatic surface, the camera r/g and b/g ratios are independent of
+    reflectance and are equal to the illuminant r/g and b/g in camera space.
+    Averaging over multiple neutral patches reduces measurement noise.
+    Uses Bradford adaptation (camera space ≈ cone space) to convert to XYZ.
+
+    Patches with values below min_value (too dark, noisy) are excluded.
+    """
+    neutral_rgb = normalized_rgb[neutral_indices].astype(np.float64)
+    valid = np.all(neutral_rgb > min_value, axis=1) & np.all(neutral_rgb < 0.99, axis=1)
+    if not np.any(valid):
+        return np.asarray(reference_white, dtype=np.float64).copy()
+    valid_rgb = neutral_rgb[valid]
+
+    r_g = valid_rgb[:, 0] / valid_rgb[:, 1]
+    b_g = valid_rgb[:, 2] / valid_rgb[:, 1]
+    scene_cam = np.array([np.mean(r_g), 1.0, np.mean(b_g)], dtype=np.float64)
+
+    day = np.array([float(daylight_wb[0]), float(daylight_wb[1]), float(daylight_wb[2])], dtype=np.float64)
+    if day[1] == 0.0:
+        return np.asarray(reference_white, dtype=np.float64).copy()
+    day_norm = day / day[1]
+    # D65 illuminant in camera space ∝ 1/daylight_wb (lower gain → more illuminant light)
+    d65_cam = (1.0 / day_norm)
+    d65_cam /= d65_cam[1]
+
+    wb_ratio = scene_cam / d65_cam
+
+    ref_white = np.asarray(reference_white, dtype=np.float64)
+    ref_bradford = BRADFORD_MATRIX @ ref_white
+    scene_bradford = ref_bradford * wb_ratio
+    scene_white = np.linalg.inv(BRADFORD_MATRIX) @ scene_bradford
+    return scene_white / scene_white[1]
+
+
+def estimate_scene_white_from_camera_wb(
+    camera_wb: tuple,
+    daylight_wb: tuple,
+    reference_white: np.ndarray,
+) -> np.ndarray:
+    """Estimate the actual scene illuminant XYZ from camera white-balance multipliers.
+
+    Uses the ratio (daylight_wb / camera_wb) — normalised to G=1 — as a Bradford-space
+    scaling factor relative to the reference illuminant (typically D65).  This avoids
+    the inaccurate metadata rgb_xyz_matrix and relies only on WB ratios.
+
+    Returns a Y-normalised XYZ white point for the measured scene illuminant.
+    """
+    cam = np.array([float(camera_wb[0]), float(camera_wb[1]), float(camera_wb[2])], dtype=np.float64)
+    day = np.array([float(daylight_wb[0]), float(daylight_wb[1]), float(daylight_wb[2])], dtype=np.float64)
+    if cam[1] == 0.0 or day[1] == 0.0:
+        return np.asarray(reference_white, dtype=np.float64).copy()
+    cam_norm = cam / cam[1]
+    day_norm = day / day[1]
+    # daylight_wb represents the D65 illuminant response; camera_wb the actual scene.
+    # A lower camera R gain → more R light in scene → warmer than D65.
+    # In Bradford space the illuminant scales as: scene = reference × (day_norm / cam_norm).
+    wb_ratio = day_norm / cam_norm
+    ref_white = np.asarray(reference_white, dtype=np.float64)
+    ref_bradford = BRADFORD_MATRIX @ ref_white
+    scene_bradford = ref_bradford * wb_ratio
+    scene_white = np.linalg.inv(BRADFORD_MATRIX) @ scene_bradford
+    scene_white = scene_white / scene_white[1]
+    return scene_white
 
 
 def find_raw_path(image_dir: Path) -> Path:
@@ -211,6 +285,50 @@ def predict_hppcc(
     return hppcc_model.predict(rgb)
 
 
+def predict_hppcc_rpcc(
+    model: HPPCCRPCCModel,
+    rgb: np.ndarray,
+    *,
+    use_blending: bool,
+    blend_width: float,
+) -> np.ndarray:
+    if use_blending:
+        return model.predict_blending(rgb, blend_width=blend_width)
+    return model.predict(rgb)
+
+
+
+def hppcc_rpcc_model_to_dict(model: HPPCCRPCCModel) -> dict[str, object]:
+    return {
+        "hppcc": hppcc_model_to_dict(model.hppcc),
+        "rpcc_residual": rpcc_model_to_dict(model.rpcc_residual),
+    }
+
+
+def hppcc_rpcc_model_from_dict(payload: dict[str, object]) -> HPPCCRPCCModel:
+    return HPPCCRPCCModel(
+        hppcc=hppcc_model_from_dict(payload["hppcc"]),
+        rpcc_residual=rpcc_model_from_dict(payload["rpcc_residual"]),
+    )
+
+
+def rpcc_model_to_dict(model: RPCCModel) -> dict[str, object]:
+    return {
+        "matrix": np.asarray(model.matrix, dtype=np.float64).tolist(),
+        "white_rgb": np.asarray(model.white_rgb, dtype=np.float64).tolist(),
+        "white_xyz": np.asarray(model.white_xyz, dtype=np.float64).tolist(),
+    }
+
+
+def rpcc_model_from_dict(payload: dict[str, object]) -> RPCCModel:
+    return RPCCModel(
+        matrix=np.asarray(payload["matrix"], dtype=np.float64),
+        white_rgb=np.asarray(payload["white_rgb"], dtype=np.float64),
+        white_xyz=np.asarray(payload["white_xyz"], dtype=np.float64),
+    )
+
+
+
 def linear_model_to_dict(model: LinearWhitePreservingModel) -> dict[str, object]:
     return {
         "matrix": np.asarray(model.matrix, dtype=np.float64).tolist(),
@@ -295,8 +413,10 @@ def summarize_model(
     white_index: int,
     chromatic_indices: np.ndarray,
     hppcc_regions: int,
+    optimize_boundaries: bool = False,
     use_hppcc_blending: bool = False,
     hppcc_blend_width: float = 0.15,
+    perform_nonlinear_corrections: bool = True,
 ) -> dict[str, object]:
     training_indices = np.arange(measured_rgb.shape[0], dtype=int)
     measured_rgb_train = measured_rgb[training_indices]
@@ -311,12 +431,7 @@ def summarize_model(
         white_index=white_index_train,
     )
     baseline_xyz = baseline.predict(measured_rgb)
-    baseline_de00 = delta_e00_summary(
-        src_module,
-        baseline_xyz,
-        reference_xyz,
-        illuminant_white,
-    )
+    baseline_de00 = delta_e00_summary(src_module, baseline_xyz, reference_xyz, illuminant_white)
 
     hppcc = src_module.fit_hppcc(
         measured_rgb_train,
@@ -324,26 +439,35 @@ def summarize_model(
         white_index=white_index_train,
         chromatic_indices=chromatic_indices_train,
         k_regions=hppcc_regions,
+        optimize_boundaries=optimize_boundaries,
     )
-    hppcc_xyz = predict_hppcc(
-        hppcc,
-        measured_rgb,
-        use_blending=use_hppcc_blending,
-        blend_width=hppcc_blend_width,
-    )
-    hppcc_de00 = delta_e00_summary(
-        src_module,
-        hppcc_xyz,
-        reference_xyz,
-        illuminant_white,
-    )
+    hppcc_xyz = predict_hppcc(hppcc, measured_rgb, use_blending=use_hppcc_blending, blend_width=hppcc_blend_width)
+    hppcc_de00 = delta_e00_summary(src_module, hppcc_xyz, reference_xyz, illuminant_white)
 
-    return {
+    result = {
         "baseline": baseline,
         "baseline_de00": baseline_de00,
         "hppcc": hppcc,
         "hppcc_de00": hppcc_de00,
     }
+
+    if perform_nonlinear_corrections:
+        hppcc_rpcc = src_module.fit_hppcc_rpcc(
+            measured_rgb_train,
+            reference_xyz_train,
+            white_index=white_index_train,
+            chromatic_indices=chromatic_indices_train,
+            k_regions=hppcc_regions,
+            optimize_boundaries=optimize_boundaries,
+        )
+        hppcc_rpcc_xyz = predict_hppcc_rpcc(
+            hppcc_rpcc, measured_rgb, use_blending=use_hppcc_blending, blend_width=hppcc_blend_width
+        )
+        hppcc_rpcc_de00 = delta_e00_summary(src_module, hppcc_rpcc_xyz, reference_xyz, illuminant_white)
+        result["hppcc_rpcc"] = hppcc_rpcc
+        result["hppcc_rpcc_de00"] = hppcc_rpcc_de00
+
+    return result
 
 
 def evaluate_illuminants(
@@ -393,10 +517,27 @@ def evaluate_illuminants(
             adapted_reference_xyz,
             target_white,
         )
+        illuminant_results[illuminant_name]["rpcc_de00"] = delta_e00_summary(
+            src_module,
+            illuminant_results[illuminant_name]["rpcc"].predict(measured_rgb),
+            adapted_reference_xyz,
+            target_white,
+        )
         illuminant_results[illuminant_name]["hppcc_de00"] = delta_e00_summary(
             src_module,
             predict_hppcc(
                 illuminant_results[illuminant_name]["hppcc"],
+                measured_rgb,
+                use_blending=use_hppcc_blending,
+                blend_width=hppcc_blend_width,
+            ),
+            adapted_reference_xyz,
+            target_white,
+        )
+        illuminant_results[illuminant_name]["rpcc_hppcc_de00"] = delta_e00_summary(
+            src_module,
+            predict_rpcc_hppcc(
+                illuminant_results[illuminant_name]["rpcc_hppcc"],
                 measured_rgb,
                 use_blending=use_hppcc_blending,
                 blend_width=hppcc_blend_width,

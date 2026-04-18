@@ -12,6 +12,7 @@ from src.config import (
     OUTPUT_DIR,
     OUTPUT_COLORSPACE,
     OUTPUT_FORMAT,
+    PERFORM_NONLINEAR_CORRECTIONS,
     REFERENCE_ILLUMINANT,
     REFERENCE_PATH,
     SHOW_DETECTION_PREVIEW,
@@ -102,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=USE_HPPCC_BLENDING,
         help="Use predict_blending instead of hard HPPCC prediction.",
+    )
+    analyze.add_argument(
+        "--perform-nonlinear-corrections",
+        action=argparse.BooleanOptionalAction,
+        default=PERFORM_NONLINEAR_CORRECTIONS,
+        help="If set, fits HPPCC+RPCC (nonlinear residual). Otherwise, uses HPPCC only.",
     )
     analyze.add_argument(
         "--show-detection-preview",

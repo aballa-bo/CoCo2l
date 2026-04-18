@@ -100,23 +100,44 @@ def print_overlay_summary(output_dir: Path) -> None:
     print(f"Overlay images written to: {output_dir}")
 
 
-def print_illuminant_report(reference_illuminant: str, illuminant_results: dict[str, dict[str, object]]) -> str:
-    print()
-    print(f"Illuminant check from {reference_illuminant} references")
-    for illuminant_name, result in illuminant_results.items():
-        de00 = result["baseline_de00"]
-        print(
-            f"{illuminant_name}: mean={float(np.mean(de00)):.4f}, "
-            f"median={float(np.median(de00)):.4f}, max={float(np.max(de00)):.4f}"
-        )
+def _cct_from_xyz(xyz: np.ndarray) -> float | None:
+    xyz_sum = float(np.sum(xyz))
+    if xyz_sum <= 0:
+        return None
+    x = float(xyz[0]) / xyz_sum
+    y = float(xyz[1]) / xyz_sum
+    n = (x - 0.3320) / (0.1858 - y)
+    return 449.0 * n**3 + 3525.0 * n**2 + 6823.3 * n + 5520.33
 
-    best_illuminant = min(
-        illuminant_results,
-        key=lambda name: np.mean(illuminant_results[name]["baseline_de00"]),
-    )
+
+def print_scene_white_report(
+    reference_white: np.ndarray,
+    scene_white: np.ndarray,
+    camera_wb_white: np.ndarray | None = None,
+    neutral_patch_white: np.ndarray | None = None,
+) -> None:
     print()
-    print(f"Best illuminant: {best_illuminant}")
-    return best_illuminant
+    print("Scene illuminant estimation")
+    print(
+        f"  reference white XYZ: [{reference_white[0]:.5f}, {reference_white[1]:.5f}, {reference_white[2]:.5f}]"
+    )
+    if camera_wb_white is not None:
+        cct = _cct_from_xyz(camera_wb_white)
+        cct_str = f"  ~{cct:.0f} K" if cct is not None else ""
+        print(
+            f"  camera WB estimate:  [{camera_wb_white[0]:.5f}, {camera_wb_white[1]:.5f}, {camera_wb_white[2]:.5f}]{cct_str}"
+        )
+    if neutral_patch_white is not None:
+        cct = _cct_from_xyz(neutral_patch_white)
+        cct_str = f"  ~{cct:.0f} K" if cct is not None else ""
+        print(
+            f"  neutral patches:     [{neutral_patch_white[0]:.5f}, {neutral_patch_white[1]:.5f}, {neutral_patch_white[2]:.5f}]{cct_str}"
+        )
+    cct = _cct_from_xyz(scene_white)
+    cct_str = f"  ~{cct:.0f} K" if cct is not None else ""
+    print(
+        f"  used (scene white):  [{scene_white[0]:.5f}, {scene_white[1]:.5f}, {scene_white[2]:.5f}]{cct_str}"
+    )
 
 
 def print_metadata_matrix_report(
@@ -134,18 +155,23 @@ def print_patch_delta_e_report(
     patch_names: list[str],
     baseline_de00: np.ndarray,
     hppcc_de00: np.ndarray,
+    hppcc_rpcc_de00: np.ndarray | None,
 ) -> None:
     print()
     print("deltaE00 by patch")
-    for patch_index, (patch_name, baseline_value, hppcc_value) in enumerate(
+    for patch_index, (patch_name, bl, hp) in enumerate(
         zip(patch_names, baseline_de00, hppcc_de00, strict=False),
         start=1,
     ):
-        print(
+        line = (
             f"{patch_index:02d} {patch_name:<15} "
-            f"baseline={float(baseline_value):.4f} "
-            f"hppcc={float(hppcc_value):.4f}"
+            f"baseline={float(bl):.4f} "
+            f"hppcc={float(hp):.4f}"
         )
+        if hppcc_rpcc_de00 is not None:
+            hr = hppcc_rpcc_de00[patch_index - 1]
+            line += f" hppcc+rpcc={float(hr):.4f}"
+        print(line)
 
 
 def print_hppcc_region_report(
@@ -193,11 +219,12 @@ def print_hppcc_region_report(
 def print_hppcc_candidate_report(
     candidate_results: list[dict[str, object]],
     *,
+    perform_nonlinear_corrections: bool,
     use_hppcc_blending: bool,
     hppcc_blend_width: float,
 ) -> int:
     print()
-    print("HPPCC multi-k comparison")
+    print("Multi-k model comparison (scene-measured white, optimised boundaries)")
     if use_hppcc_blending:
         print(f"Prediction mode: blending (blend_width={hppcc_blend_width:.3f})")
     else:
@@ -205,16 +232,22 @@ def print_hppcc_candidate_report(
     best_index = 0
     best_value = float("inf")
     for index, result in enumerate(candidate_results):
-        hppcc_mean = float(np.mean(result["best"]["hppcc_de00"]))
-        baseline_mean = float(np.mean(result["best"]["baseline_de00"]))
-        print(
-            f"k={int(result['k'])} "
-            f"illuminant={result['best_illuminant']} "
-            f"baseline_mean={baseline_mean:.4f} "
-            f"hppcc_mean={hppcc_mean:.4f}"
+        best = result["best"]
+        baseline_mean = float(np.mean(best["baseline_de00"]))
+        hppcc_mean = float(np.mean(best["hppcc_de00"]))
+        primary_mean = hppcc_mean
+        line = (
+            f"k={int(result['k'])}  "
+            f"baseline={baseline_mean:.4f}  "
+            f"hppcc={hppcc_mean:.4f}"
         )
-        if hppcc_mean < best_value:
-            best_value = hppcc_mean
+        if perform_nonlinear_corrections and "hppcc_rpcc_de00" in best:
+            hppcc_rpcc_mean = float(np.mean(best["hppcc_rpcc_de00"]))
+            line += f"  hppcc+rpcc={hppcc_rpcc_mean:.4f}"
+            primary_mean = hppcc_rpcc_mean
+        print(line)
+        if primary_mean < best_value:
+            best_value = primary_mean
             best_index = index
     print()
     print(f"Selected k: {int(candidate_results[best_index]['k'])}")
@@ -225,6 +258,7 @@ def print_model_report(
     best: dict[str, object],
     hppcc_regions: int,
     *,
+    perform_nonlinear_corrections: bool,
     use_hppcc_blending: bool,
     hppcc_blend_width: float,
 ) -> None:
@@ -245,3 +279,15 @@ def print_model_report(
     print("deltaE00 mean:", float(np.mean(best["hppcc_de00"])))
     print("deltaE00 median:", float(np.median(best["hppcc_de00"])))
     print("deltaE00 max:", float(np.max(best["hppcc_de00"])))
+
+    if perform_nonlinear_corrections and "hppcc_rpcc" in best:
+        print()
+        print(f"HPPCC + RPCC residual ({hppcc_regions} regions)")
+        if use_hppcc_blending:
+            print(f"prediction mode: blending (blend_width={hppcc_blend_width:.3f})")
+        else:
+            print("prediction mode: hard")
+        print("matrices shape:", best["hppcc_rpcc"].matrices.shape)
+        print("deltaE00 mean:", float(np.mean(best["hppcc_rpcc_de00"])))
+        print("deltaE00 median:", float(np.median(best["hppcc_rpcc_de00"])))
+        print("deltaE00 max:", float(np.max(best["hppcc_rpcc_de00"])))
