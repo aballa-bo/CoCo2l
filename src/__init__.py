@@ -5,7 +5,7 @@ from .colorchecker import (
     CLASSIC_24_NEUTRAL_NAMES,
     CLASSIC_24_PATCH_NAMES,
 )
-from .metrics import delta_e_2000, hue_angle_from_rgb, xyz_to_lab
+from .metrics import delta_e_2000, hue_angle_from_rgb, lab_to_xyz, xyy_to_xyz, xyz_to_lab
 from .models import (
     HPPCCModel,
     HPPCCRPCCModel,
@@ -18,6 +18,7 @@ from .models import (
 )
 from .raw import RawLinearImage, load_raw_linear_rgb
 from .sampling import sample_patch_means, sample_patch_means_from_masks
+from .utils import load_reference_chroma, load_reference_lab, load_reference_rgb, load_reference_white_xyz, load_reference_xyy, load_reference_xyz
 
 __all__ = [
     "CLASSIC_24_CHROMATIC_NAMES",
@@ -34,8 +35,16 @@ __all__ = [
     "fit_rpcc",
     "fit_white_preserving_3x3",
     "hue_angle_from_rgb",
+    "lab_to_xyz",
     "load_raw_linear_rgb",
+    "load_reference_chroma",
+    "load_reference_lab",
+    "load_reference_rgb",
+    "load_reference_white_xyz",
+    "load_reference_xyy",
+    "load_reference_xyz",
     "sample_patch_means",
     "sample_patch_means_from_masks",
+    "xyy_to_xyz",
     "xyz_to_lab",
 ]

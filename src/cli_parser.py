@@ -5,17 +5,26 @@ from pathlib import Path
 import numpy as np
 
 from src.config import (
+    ANALYSIS_DIR,
     CHROMATIC_INDICES,
+    DENOISE_METHOD,
+    DENOISE_DIAMETER,
+    DENOISE_SIGMA_SPACE,
+    DENOISE_STRENGTH,
+    ENABLE_PATCH_VARIANCE_DENOISE,
     HPPCC_BLEND_WIDTH,
     HPPCC_REGION_CANDIDATES,
     IMAGE_DIR,
-    OUTPUT_DIR,
     OUTPUT_COLORSPACE,
     OUTPUT_FORMAT,
     PERFORM_NONLINEAR_CORRECTIONS,
+    PROCESS_DIR,
     REFERENCE_ILLUMINANT,
     REFERENCE_PATH,
+    REFERENCE_SPACE,
+    SCENE_WHITE_SOURCE,
     SHOW_DETECTION_PREVIEW,
+    SHOW_DEVELOPED_IMAGE_PREVIEW,
     STANDARD_WHITES,
     USE_HPPCC_BLENDING,
     USE_METADATA_RGB_XYZ_BASELINE,
@@ -52,6 +61,129 @@ def parse_standard_whites(value: str) -> dict[str, np.ndarray]:
     return parsed
 
 
+def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defaults: bool) -> None:
+    parser.add_argument(
+        "--white-index",
+        type=int,
+        default=WHITE_INDEX if use_defaults else None,
+        help="Zero-based white patch index.",
+    )
+    parser.add_argument(
+        "--chromatic-indices",
+        type=parse_indices,
+        default=CHROMATIC_INDICES.copy() if use_defaults else None,
+        help="Comma-separated zero-based chromatic patch indices.",
+    )
+    parser.add_argument(
+        "--hppcc-region-candidates",
+        type=parse_indices,
+        default=np.asarray(HPPCC_REGION_CANDIDATES, dtype=int) if use_defaults else None,
+        help="Comma-separated HPPCC region counts to compare.",
+    )
+    parser.add_argument(
+        "--reference-illuminant",
+        type=str,
+        default=REFERENCE_ILLUMINANT if use_defaults else None,
+        help="Reference illuminant key.",
+    )
+    parser.add_argument(
+        "--reference-space",
+        choices=("xyz", "lab", "xyy"),
+        default=REFERENCE_SPACE if use_defaults else None,
+        help="Reference dataset representation used in the reference JSON.",
+    )
+    parser.add_argument(
+        "--standard-whites-json",
+        type=parse_standard_whites,
+        default={key: value.copy() for key, value in STANDARD_WHITES.items()} if use_defaults else None,
+        help='JSON object overriding standard whites, e.g. \'{"D65":[0.95047,1,1.08883]}\'',
+    )
+    parser.add_argument(
+        "--scene-white-source",
+        choices=("auto", "reference", "camera-wb", "neutral-patches"),
+        default=SCENE_WHITE_SOURCE if use_defaults else None,
+        help="Scene white estimate to use for reference adaptation.",
+    )
+    parser.add_argument(
+        "--patch-variance-denoise",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_PATCH_VARIANCE_DENOISE if use_defaults else None,
+        help="Estimate noise from chart patches and denoise linear RGB before fitting.",
+    )
+    parser.add_argument(
+        "--denoise-method",
+        choices=("wavelet", "bilateral"),
+        default=DENOISE_METHOD if use_defaults else None,
+        help="Denoising method used with the patch-derived noise profile.",
+    )
+    parser.add_argument(
+        "--denoise-strength",
+        type=float,
+        default=DENOISE_STRENGTH if use_defaults else None,
+        help="Strength parameter applied to the estimated per-channel noise sigma.",
+    )
+    parser.add_argument(
+        "--denoise-diameter",
+        type=int,
+        default=DENOISE_DIAMETER if use_defaults else None,
+        help="Neighborhood diameter for bilateral denoising.",
+    )
+    parser.add_argument(
+        "--denoise-sigma-space",
+        type=float,
+        default=DENOISE_SIGMA_SPACE if use_defaults else None,
+        help="Spatial sigma for bilateral denoising in pixels.",
+    )
+    parser.add_argument(
+        "--use-metadata-rgb-xyz-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=USE_METADATA_RGB_XYZ_BASELINE if use_defaults else None,
+        help="Enable metadata rgb_xyz_matrix baseline report.",
+    )
+    parser.add_argument(
+        "--use-hppcc-blending",
+        action=argparse.BooleanOptionalAction,
+        default=USE_HPPCC_BLENDING if use_defaults else None,
+        help="Use predict_blending instead of hard HPPCC prediction.",
+    )
+    parser.add_argument(
+        "--hppcc-blend-width",
+        type=float,
+        default=HPPCC_BLEND_WIDTH if use_defaults else None,
+        help="Blend width fraction for HPPCC soft prediction.",
+    )
+    parser.add_argument(
+        "--perform-nonlinear-corrections",
+        action=argparse.BooleanOptionalAction,
+        default=PERFORM_NONLINEAR_CORRECTIONS if use_defaults else None,
+        help="If set, fits HPPCC+RPCC (nonlinear residual). Otherwise, uses HPPCC only.",
+    )
+    parser.add_argument(
+        "--show-detection-preview",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_DETECTION_PREVIEW if use_defaults else None,
+        help="Show detection preview windows.",
+    )
+    parser.add_argument(
+        "--show-developed-image-preview",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_DEVELOPED_IMAGE_PREVIEW if use_defaults else None,
+        help="Show a preview window of the developed image after analysis.",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=("tif", "jpeg", "png"),
+        default=OUTPUT_FORMAT if use_defaults else None,
+        help="Output image format.",
+    )
+    parser.add_argument(
+        "--output-colorspace",
+        choices=("sRGB", "Display-P3"),
+        default=OUTPUT_COLORSPACE if use_defaults else None,
+        help="Output RGB colorspace.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="HPPCC RAW analyzer.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -60,83 +192,19 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--cc-image", type=Path, default=None, help="RAW file to analyze.")
     analyze.add_argument("--image-dir", type=Path, default=IMAGE_DIR, help="Directory used when --cc-image is omitted.")
     analyze.add_argument("--reference-path", type=Path, default=REFERENCE_PATH, help="Reference JSON path.")
-    analyze.add_argument("--output-dir", type=Path, default=OUTPUT_DIR, help="Output directory.")
-    analyze.add_argument("--white-index", type=int, default=WHITE_INDEX, help="Zero-based white patch index.")
-    analyze.add_argument(
-        "--chromatic-indices",
-        type=parse_indices,
-        default=CHROMATIC_INDICES.copy(),
-        help="Comma-separated zero-based chromatic patch indices.",
-    )
-    analyze.add_argument(
-        "--hppcc-region-candidates",
-        type=parse_indices,
-        default=np.asarray(HPPCC_REGION_CANDIDATES, dtype=int),
-        help="Comma-separated HPPCC region counts to compare.",
-    )
-    analyze.add_argument(
-        "--reference-illuminant",
-        type=str,
-        default=REFERENCE_ILLUMINANT,
-        help="Reference illuminant key.",
-    )
-    analyze.add_argument(
-        "--standard-whites-json",
-        type=parse_standard_whites,
-        default={key: value.copy() for key, value in STANDARD_WHITES.items()},
-        help='JSON object overriding standard whites, e.g. \'{"D65":[0.95047,1,1.08883]}\'',
-    )
-    analyze.add_argument(
-        "--hppcc-blend-width",
-        type=float,
-        default=HPPCC_BLEND_WIDTH,
-        help="Blend width fraction for HPPCC soft prediction.",
-    )
-    analyze.add_argument(
-        "--use-metadata-rgb-xyz-baseline",
-        action=argparse.BooleanOptionalAction,
-        default=USE_METADATA_RGB_XYZ_BASELINE,
-        help="Enable metadata rgb_xyz_matrix baseline report.",
-    )
-    analyze.add_argument(
-        "--use-hppcc-blending",
-        action=argparse.BooleanOptionalAction,
-        default=USE_HPPCC_BLENDING,
-        help="Use predict_blending instead of hard HPPCC prediction.",
-    )
-    analyze.add_argument(
-        "--perform-nonlinear-corrections",
-        action=argparse.BooleanOptionalAction,
-        default=PERFORM_NONLINEAR_CORRECTIONS,
-        help="If set, fits HPPCC+RPCC (nonlinear residual). Otherwise, uses HPPCC only.",
-    )
-    analyze.add_argument(
-        "--show-detection-preview",
-        action=argparse.BooleanOptionalAction,
-        default=SHOW_DETECTION_PREVIEW,
-        help="Show detection preview windows.",
-    )
-    analyze.add_argument(
-        "--output-format",
-        choices=("tif", "jpeg", "png"),
-        default=OUTPUT_FORMAT,
-        help="Output image format.",
-    )
-    analyze.add_argument(
-        "--output-colorspace",
-        choices=("sRGB", "Display-P3"),
-        default=OUTPUT_COLORSPACE,
-        help="Output RGB colorspace.",
-    )
+    analyze.add_argument("--analysis-dir", type=Path, default=ANALYSIS_DIR, help="Output directory for analysis files (overlays, JSON).")
+    analyze.add_argument("--process-dir", type=Path, default=PROCESS_DIR, help="Output directory for developed images.")
+    _add_analysis_config_arguments(analyze, use_defaults=True)
 
     process = subparsers.add_parser("process", help="Process a folder of RAW files using a saved analysis result.")
-    process.add_argument("result_json", type=Path, help="Path to result_<raw>.json produced by analyze.")
+    process.add_argument("result_json", type=Path, help="Path to <stem>_correction.json produced by analyze.")
     process.add_argument("folder_to_process", type=Path, help="Folder containing RAW files to process.")
-    process.add_argument("--output-dir", type=Path, default=None, help="Output directory for corrected images.")
+    process.add_argument("--process-dir", type=Path, default=None, help="Output directory for developed images.")
     process.add_argument(
         "--workers",
         type=int,
         default=None,
         help="Number of parallel workers. Default: min(available CPUs, number of RAW files).",
     )
+    _add_analysis_config_arguments(process, use_defaults=False)
     return parser

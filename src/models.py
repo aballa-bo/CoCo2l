@@ -22,7 +22,10 @@ def _solve_constrained_least_squares(a: np.ndarray, x: np.ndarray, c: np.ndarray
         ]
     )
     rhs = np.vstack([2.0 * a.T @ x, b])
-    solution = np.linalg.solve(lhs, rhs)
+    try:
+        solution = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        solution, _, _, _ = np.linalg.lstsq(lhs, rhs, rcond=None)
     return solution[: a.shape[1], :]
 
 
@@ -273,18 +276,23 @@ def fit_hppcc(
     white_rgb = rgb[white_index]
     white_xyz = xyz[white_index]
 
-    if optimize_boundaries:
-        boundaries = _exhaustive_boundary_search(
-            q_sorted, p_sorted, angles_sorted, k_regions, white_rgb, white_xyz,
-            min_per_region=3,
-        )
-    else:
-        boundaries = _equal_count_boundaries(angles_sorted, k_regions)
+    min_k = 2
+    while k_regions >= min_k:
+        if optimize_boundaries:
+            boundaries = _exhaustive_boundary_search(
+                q_sorted, p_sorted, angles_sorted, k_regions, white_rgb, white_xyz,
+                min_per_region=3,
+            )
+        else:
+            boundaries = _equal_count_boundaries(angles_sorted, k_regions)
 
-    region_ids = _assign_regions(angles_sorted, boundaries)
-    counts = np.bincount(region_ids, minlength=k_regions)
-    if np.any(counts == 0):
-        raise ValueError("Hue partitioning produced an empty region.")
+        region_ids = _assign_regions(angles_sorted, boundaries)
+        counts = np.bincount(region_ids, minlength=k_regions)
+        if not np.any(counts == 0):
+            break
+        k_regions -= 1
+    else:
+        raise ValueError("Hue partitioning produced an empty region even with k_regions=2.")
 
     matrices = _fit_hppcc_constrained(q_sorted, p_sorted, boundaries, region_ids, white_rgb, white_xyz)
     return HPPCCModel(

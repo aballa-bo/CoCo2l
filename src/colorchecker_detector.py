@@ -23,6 +23,10 @@ class ColorCheckerDetectionResult:
     patch_images: list[np.ndarray]
     colour_checker_shape: tuple[int, int, int]
     swatch_masks_shape: tuple[int, int]
+    orientation_steps: int
+    orientation_mirrored: bool
+    detected_white_index: int
+    detected_black_index: int
 
 
 def recover_relative_patch_centers(swatch_masks: np.ndarray) -> np.ndarray:
@@ -119,6 +123,46 @@ def find_white_index(rgb_array: np.ndarray) -> int:
     return int(np.argmax(row_means))
 
 
+def find_black_index(rgb_array: np.ndarray) -> int:
+    row_means = rgb_array.mean(axis=1)
+    return int(np.argmin(row_means))
+
+
+def mirror_relative_patch_centers(
+    relative_patch_centers: np.ndarray,
+    rectified_shape: tuple[int, int, int],
+) -> np.ndarray:
+    height, width = rectified_shape[:2]
+    _ = height
+    centers = np.asarray(relative_patch_centers, dtype=np.float64).reshape(4, 6, 2).copy()
+    centers[..., 0] = (width - 1.0) - centers[..., 0]
+    centers = centers[:, ::-1, :]
+    return centers.reshape(-1, 2)
+
+
+def orientation_score(
+    rgb_array: np.ndarray,
+    *,
+    white_index: int,
+    black_index: int,
+) -> tuple[float, ...]:
+    means = np.asarray(rgb_array, dtype=np.float64).mean(axis=1)
+    white_rank = int(np.sum(means > means[white_index]))
+    black_rank = int(np.sum(means < means[black_index]))
+    neutral_means = means[white_index : black_index + 1]
+    neutral_rise = np.maximum(np.diff(neutral_means), 0.0)
+    neutral_violation_count = int(np.count_nonzero(neutral_rise > 0.0))
+    neutral_violation_sum = float(np.sum(neutral_rise))
+    white_black_contrast = float(means[white_index] - means[black_index])
+    return (
+        float(white_rank),
+        float(black_rank),
+        float(neutral_violation_count),
+        neutral_violation_sum,
+        -white_black_contrast,
+    )
+
+
 def choose_json_orientation(
     scene_image: np.ndarray,
     rectified_shape: tuple[int, int, int],
@@ -126,21 +170,44 @@ def choose_json_orientation(
     relative_patch_centers: np.ndarray,
     measurement_patch_size: tuple[int, int],
     white_index: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, bool, int, int]:
     ordered_quad = order_quadrilateral_tl_tr_br_bl(quadrilateral)
+    black_index = relative_patch_centers.shape[0] - 1
+    best_candidate = None
+    best_score = None
 
     for steps in range(4):
         candidate_quad = rotate_quad_order(ordered_quad, steps)
         homography = compute_rectified_to_scene_homography(rectified_shape, candidate_quad)
+        for mirrored in (False, True):
+            candidate_centers = (
+                mirror_relative_patch_centers(relative_patch_centers, rectified_shape)
+                if mirrored
+                else relative_patch_centers
+            )
+            absolute_centers = map_points_homography(candidate_centers, homography)
+            rgb = retrieve_rgb_from_image(scene_image, absolute_centers, measurement_patch_size)
+            current_white_index = find_white_index(rgb)
+            current_black_index = find_black_index(rgb)
+            score = orientation_score(rgb, white_index=white_index, black_index=black_index)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_candidate = (
+                    candidate_quad,
+                    absolute_centers,
+                    rgb,
+                    steps,
+                    mirrored,
+                    current_white_index,
+                    current_black_index,
+                )
+
+    if best_candidate is None:
+        homography = compute_rectified_to_scene_homography(rectified_shape, ordered_quad)
         absolute_centers = map_points_homography(relative_patch_centers, homography)
         rgb = retrieve_rgb_from_image(scene_image, absolute_centers, measurement_patch_size)
-        if find_white_index(rgb) == white_index:
-            return candidate_quad, absolute_centers, rgb
-
-    homography = compute_rectified_to_scene_homography(rectified_shape, ordered_quad)
-    absolute_centers = map_points_homography(relative_patch_centers, homography)
-    rgb = retrieve_rgb_from_image(scene_image, absolute_centers, measurement_patch_size)
-    return ordered_quad, absolute_centers, rgb
+        return ordered_quad, absolute_centers, rgb, 0, False, find_white_index(rgb), find_black_index(rgb)
+    return best_candidate
 
 
 def extract_patch_images(
@@ -332,7 +399,7 @@ def detect_and_orient_colorchecker(
         relative_patch_centers,
         scale=PREVIEW_PATCH_SCALE,
     )
-    quadrilateral, absolute_patch_centers, measured_rgb = choose_json_orientation(
+    quadrilateral, absolute_patch_centers, measured_rgb, orientation_steps, orientation_mirrored, detected_white_index, detected_black_index = choose_json_orientation(
         scene_image,
         detection.colour_checker.shape,
         detection.quadrilateral,
@@ -353,4 +420,8 @@ def detect_and_orient_colorchecker(
         patch_images=patch_images,
         colour_checker_shape=detection.colour_checker.shape,
         swatch_masks_shape=detection.swatch_masks.shape,
+        orientation_steps=orientation_steps,
+        orientation_mirrored=orientation_mirrored,
+        detected_white_index=detected_white_index,
+        detected_black_index=detected_black_index,
     )

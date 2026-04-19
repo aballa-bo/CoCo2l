@@ -2,6 +2,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import ImageCms
 
@@ -72,11 +73,27 @@ def estimate_scene_white_from_neutral_patches(
     if not np.any(valid):
         return np.asarray(reference_white, dtype=np.float64).copy()
     valid_rgb = neutral_rgb[valid]
+    if valid_rgb.shape[0] >= 4:
+        order = np.argsort(valid_rgb[:, 1])
+        valid_rgb = valid_rgb[order][1:-1]
 
     r_g = valid_rgb[:, 0] / valid_rgb[:, 1]
     b_g = valid_rgb[:, 2] / valid_rgb[:, 1]
-    scene_cam = np.array([np.mean(r_g), 1.0, np.mean(b_g)], dtype=np.float64)
+    return _scene_white_from_neutral_ratios(
+        float(np.mean(r_g)),
+        float(np.mean(b_g)),
+        daylight_wb,
+        reference_white,
+    )
 
+
+def _scene_white_from_neutral_ratios(
+    r_g: float,
+    b_g: float,
+    daylight_wb: tuple,
+    reference_white: np.ndarray,
+) -> np.ndarray:
+    scene_cam = np.array([r_g, 1.0, b_g], dtype=np.float64)
     day = np.array([float(daylight_wb[0]), float(daylight_wb[1]), float(daylight_wb[2])], dtype=np.float64)
     if day[1] == 0.0:
         return np.asarray(reference_white, dtype=np.float64).copy()
@@ -86,12 +103,224 @@ def estimate_scene_white_from_neutral_patches(
     d65_cam /= d65_cam[1]
 
     wb_ratio = scene_cam / d65_cam
-
     ref_white = np.asarray(reference_white, dtype=np.float64)
     ref_bradford = BRADFORD_MATRIX @ ref_white
     scene_bradford = ref_bradford * wb_ratio
     scene_white = np.linalg.inv(BRADFORD_MATRIX) @ scene_bradford
     return scene_white / scene_white[1]
+
+
+def estimate_cct_from_xyz(xyz: np.ndarray) -> float | None:
+    xyz_sum = float(np.sum(xyz))
+    if xyz_sum <= 0:
+        return None
+    x = float(xyz[0]) / xyz_sum
+    y = float(xyz[1]) / xyz_sum
+    n = (x - 0.3320) / (0.1858 - y)
+    return 449.0 * n**3 + 3525.0 * n**2 + 6823.3 * n + 5520.33
+
+
+def xyz_to_xy(xyz: np.ndarray) -> np.ndarray:
+    xyz = np.asarray(xyz, dtype=np.float64)
+    xyz_sum = float(np.sum(xyz))
+    if xyz_sum <= 0.0:
+        return np.array([np.nan, np.nan], dtype=np.float64)
+    return np.array([xyz[0] / xyz_sum, xyz[1] / xyz_sum], dtype=np.float64)
+
+
+def _middle_neutral_indices(normalized_rgb: np.ndarray, neutral_indices: np.ndarray, min_value: float = 0.01) -> np.ndarray:
+    neutral_indices = np.asarray(neutral_indices, dtype=int)
+    neutral_rgb = np.asarray(normalized_rgb[neutral_indices], dtype=np.float64)
+    valid = np.all(neutral_rgb > min_value, axis=1) & np.all(neutral_rgb < 0.99, axis=1)
+    selected = neutral_indices[valid]
+    if selected.size == 0:
+        return neutral_indices
+    if selected.size >= 4:
+        order = np.argsort(normalized_rgb[selected, 1])
+        selected = selected[order][1:-1]
+    return selected
+
+
+def _weighted_linear_fit(x: np.ndarray, y: np.ndarray, weights: np.ndarray) -> tuple[float, float]:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    design = np.column_stack([np.ones_like(x), x])
+    weighted_design = design * weights[:, np.newaxis]
+    weighted_targets = y * weights
+    intercept, slope = np.linalg.lstsq(weighted_design, weighted_targets, rcond=None)[0]
+    return float(intercept), float(slope)
+
+
+def analyze_neutral_illuminant_gradient(
+    normalized_rgb: np.ndarray,
+    neutral_indices: np.ndarray,
+    absolute_patch_centers: np.ndarray,
+    daylight_wb: tuple,
+    reference_white: np.ndarray,
+) -> dict[str, object]:
+    neutral_indices = np.asarray(neutral_indices, dtype=int)
+    centers = np.asarray(absolute_patch_centers[neutral_indices], dtype=np.float64)
+    neutral_rgb = np.asarray(normalized_rgb[neutral_indices], dtype=np.float64)
+
+    order = np.argsort(centers[:, 0])
+    neutral_indices = neutral_indices[order]
+    centers = centers[order]
+    neutral_rgb = neutral_rgb[order]
+
+    green = neutral_rgb[:, 1]
+    safe_green = np.maximum(green, 1e-12)
+    r_over_g = neutral_rgb[:, 0] / safe_green
+    b_over_g = neutral_rgb[:, 2] / safe_green
+    weights = green / np.max(green) if np.max(green) > 0.0 else np.ones_like(green)
+
+    x_positions = centers[:, 0]
+    x_span = float(np.max(x_positions) - np.min(x_positions))
+    if x_span > 0.0:
+        x_norm = (x_positions - np.min(x_positions)) / x_span
+    else:
+        x_norm = np.zeros_like(x_positions)
+
+    local_white_xyz = np.asarray(
+        [
+            _scene_white_from_neutral_ratios(float(rg), float(bg), daylight_wb, reference_white)
+            for rg, bg in zip(r_over_g, b_over_g, strict=False)
+        ],
+        dtype=np.float64,
+    )
+    local_white_xy = np.asarray([xyz_to_xy(xyz) for xyz in local_white_xyz], dtype=np.float64)
+    local_white_cct = np.array([estimate_cct_from_xyz(xyz) for xyz in local_white_xyz], dtype=np.float64)
+
+    rg_intercept, rg_slope = _weighted_linear_fit(x_norm, r_over_g, weights)
+    bg_intercept, bg_slope = _weighted_linear_fit(x_norm, b_over_g, weights)
+    xyx_intercept, xyx_slope = _weighted_linear_fit(x_norm, local_white_xy[:, 0], weights)
+    xyy_intercept, xyy_slope = _weighted_linear_fit(x_norm, local_white_xy[:, 1], weights)
+
+    horizontal_xy_span = float(np.linalg.norm(local_white_xy[-1] - local_white_xy[0]))
+    horizontal_cct_span = (
+        float(np.nanmax(local_white_cct) - np.nanmin(local_white_cct))
+        if np.any(np.isfinite(local_white_cct))
+        else float("nan")
+    )
+    if horizontal_xy_span >= 0.008:
+        severity = "strong"
+    elif horizontal_xy_span >= 0.004:
+        severity = "moderate"
+    elif horizontal_xy_span >= 0.002:
+        severity = "possible"
+    else:
+        severity = "low"
+
+    patches: list[dict[str, object]] = []
+    for patch_index, center, rgb, rg, bg, white_xyz, white_xy, cct, weight in zip(
+        neutral_indices,
+        centers,
+        neutral_rgb,
+        r_over_g,
+        b_over_g,
+        local_white_xyz,
+        local_white_xy,
+        local_white_cct,
+        weights,
+        strict=False,
+    ):
+        patches.append(
+            {
+                "patch_index": int(patch_index),
+                "center_xy": center.tolist(),
+                "rgb": rgb.tolist(),
+                "r_over_g": float(rg),
+                "b_over_g": float(bg),
+                "local_white_xyz": white_xyz.tolist(),
+                "local_white_xy": white_xy.tolist(),
+                "local_white_cct": None if np.isnan(cct) else float(cct),
+                "weight": float(weight),
+            }
+        )
+
+    return {
+        "supports_horizontal_test": True,
+        "supports_vertical_test": False,
+        "severity": severity,
+        "x_min": float(np.min(x_positions)),
+        "x_max": float(np.max(x_positions)),
+        "horizontal_xy_span": horizontal_xy_span,
+        "horizontal_cct_span": horizontal_cct_span,
+        "r_over_g_span": float(np.max(r_over_g) - np.min(r_over_g)),
+        "b_over_g_span": float(np.max(b_over_g) - np.min(b_over_g)),
+        "weighted_rg_slope_per_chart_width": rg_slope,
+        "weighted_bg_slope_per_chart_width": bg_slope,
+        "weighted_x_slope_per_chart_width": xyx_slope,
+        "weighted_y_slope_per_chart_width": xyy_slope,
+        "left_patch_index": int(neutral_indices[0]),
+        "right_patch_index": int(neutral_indices[-1]),
+        "left_local_white_xyz": local_white_xyz[0].tolist(),
+        "right_local_white_xyz": local_white_xyz[-1].tolist(),
+        "left_local_white_xy": local_white_xy[0].tolist(),
+        "right_local_white_xy": local_white_xy[-1].tolist(),
+        "left_local_white_cct": None if np.isnan(local_white_cct[0]) else float(local_white_cct[0]),
+        "right_local_white_cct": None if np.isnan(local_white_cct[-1]) else float(local_white_cct[-1]),
+        "patches": patches,
+        "weighted_line": {
+            "r_over_g": {"intercept": rg_intercept, "slope": rg_slope},
+            "b_over_g": {"intercept": bg_intercept, "slope": bg_slope},
+            "x": {"intercept": xyx_intercept, "slope": xyx_slope},
+            "y": {"intercept": xyy_intercept, "slope": xyy_slope},
+        },
+    }
+
+def select_scene_white_source(
+    src_module,
+    measured_rgb: np.ndarray,
+    reference_xyz: np.ndarray,
+    reference_white: np.ndarray,
+    *,
+    white_index: int,
+    chromatic_indices: np.ndarray,
+    neutral_indices: np.ndarray,
+    requested_source: str,
+    camera_wb_white: np.ndarray | None,
+    neutral_patch_white: np.ndarray | None,
+) -> tuple[str, np.ndarray, dict[str, dict[str, float]]]:
+    candidates: dict[str, np.ndarray] = {"reference": np.asarray(reference_white, dtype=np.float64).copy()}
+    if camera_wb_white is not None:
+        candidates["camera-wb"] = np.asarray(camera_wb_white, dtype=np.float64).copy()
+    if neutral_patch_white is not None:
+        candidates["neutral-patches"] = np.asarray(neutral_patch_white, dtype=np.float64).copy()
+
+    if requested_source != "auto":
+        selected_white = candidates.get(requested_source)
+        if selected_white is None:
+            return "reference", candidates["reference"], {}
+        return requested_source, selected_white, {}
+
+    scoring_indices = _middle_neutral_indices(measured_rgb, neutral_indices)
+    scores: dict[str, dict[str, float]] = {}
+    best_source = "reference"
+    best_score = (float("inf"), float("inf"))
+
+    for candidate_name, candidate_white in candidates.items():
+        adapted_reference_xyz = bradford_adapt_xyz(reference_xyz, reference_white, candidate_white)
+        baseline = src_module.fit_white_preserving_3x3(
+            measured_rgb,
+            adapted_reference_xyz,
+            white_index=white_index,
+        )
+        baseline_xyz = baseline.predict(measured_rgb)
+        baseline_de00 = delta_e00_summary(src_module, baseline_xyz, adapted_reference_xyz, candidate_white)
+        neutral_mean = float(np.mean(baseline_de00[scoring_indices]))
+        overall_mean = float(np.mean(baseline_de00))
+        scores[candidate_name] = {
+            "neutral_mean_de00": neutral_mean,
+            "overall_mean_de00": overall_mean,
+            "cct": estimate_cct_from_xyz(candidate_white),
+        }
+        candidate_score = (neutral_mean, overall_mean)
+        if candidate_score < best_score:
+            best_source = candidate_name
+            best_score = candidate_score
+
+    return best_source, candidates[best_source], scores
 
 
 def estimate_scene_white_from_camera_wb(
@@ -141,13 +370,51 @@ def find_raw_paths(image_dir: Path) -> list[Path]:
     return candidates
 
 
-def load_reference_xyz(path: Path) -> np.ndarray:
+def _load_reference_triplets(path: Path, key: str) -> np.ndarray:
     data = json.loads(path.read_text(encoding="utf-8"))
-    values = data["CONFIG"]["TARGET"]["referenceXYZValues"]
-    xyz = np.asarray([values[str(i)] for i in range(1, 25)], dtype=np.float64)
-    if xyz.shape != (24, 3):
-        raise ValueError("Reference XYZ data must contain 24 patches with 3 values each.")
-    return xyz
+    values = data["CONFIG"]["TARGET"][key]
+    triplets = np.asarray([values[str(i)] for i in range(1, 25)], dtype=np.float64)
+    if triplets.shape != (24, 3):
+        raise ValueError(f"Reference data '{key}' must contain 24 patches with 3 values each.")
+    return triplets
+
+
+def _load_reference_scalars(path: Path, key: str) -> np.ndarray:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    values = data["CONFIG"]["TARGET"][key]
+    scalars = np.asarray([values[str(i)] for i in range(1, 25)], dtype=np.float64)
+    if scalars.shape != (24,):
+        raise ValueError(f"Reference data '{key}' must contain 24 scalar values.")
+    return scalars
+
+
+def load_reference_white_xyz(path: Path, reference_space: str) -> np.ndarray:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    values = data["CONFIG"]["TARGET"]["referenceWhiteXYZ"][reference_space]
+    white_xyz = np.asarray(values, dtype=np.float64)
+    if white_xyz.shape != (3,):
+        raise ValueError(f"Reference white for '{reference_space}' must contain exactly 3 values.")
+    return white_xyz
+
+
+def load_reference_xyz(path: Path) -> np.ndarray:
+    return _load_reference_triplets(path, "referenceXYZValues")
+
+
+def load_reference_rgb(path: Path) -> np.ndarray:
+    return _load_reference_triplets(path, "referenceRGBValues")
+
+
+def load_reference_lab(path: Path) -> np.ndarray:
+    return _load_reference_triplets(path, "referenceLabValues")
+
+
+def load_reference_xyy(path: Path) -> np.ndarray:
+    return _load_reference_triplets(path, "referencexyYValues")
+
+
+def load_reference_chroma(path: Path) -> np.ndarray:
+    return _load_reference_scalars(path, "referenceChromaValues")
 
 
 def delta_e00_summary(src_module, predicted_xyz: np.ndarray, reference_xyz: np.ndarray, white_xyz: np.ndarray) -> np.ndarray:
@@ -156,12 +423,73 @@ def delta_e00_summary(src_module, predicted_xyz: np.ndarray, reference_xyz: np.n
     return src_module.delta_e_2000(predicted_lab, reference_lab)
 
 
+def chroma_from_lab(lab: np.ndarray) -> np.ndarray:
+    lab = np.asarray(lab, dtype=np.float64)
+    return np.sqrt(np.square(lab[..., 1]) + np.square(lab[..., 2]))
+
+
+def chroma_error_summary(src_module, predicted_xyz: np.ndarray, illuminant_white: np.ndarray, reference_chroma: np.ndarray) -> np.ndarray:
+    predicted_lab = src_module.xyz_to_lab(predicted_xyz, illuminant_white)
+    predicted_chroma = chroma_from_lab(predicted_lab)
+    return predicted_chroma - np.asarray(reference_chroma, dtype=np.float64)
+
+
 def bradford_adapt_xyz(xyz: np.ndarray, source_white: np.ndarray, target_white: np.ndarray) -> np.ndarray:
     source_rgb = BRADFORD_MATRIX @ source_white
     target_rgb = BRADFORD_MATRIX @ target_white
     scaling = np.diag(target_rgb / source_rgb)
     adaptation = np.linalg.inv(BRADFORD_MATRIX) @ scaling @ BRADFORD_MATRIX
     return xyz @ adaptation.T
+
+
+_D65_WHITE = np.array([0.95047, 1.0, 1.08883], dtype=np.float64)
+
+
+def identify_unreliable_patches(
+    normalized_rgb: np.ndarray,
+    white_index: int,
+    min_level: float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (reliable_indices, excluded_indices) based on per-channel signal level.
+
+    A patch is considered unreliable when any normalized channel is <= min_level.
+    This threshold is intentionally low (1e-4): it targets only patches where a channel
+    has clipped below the sensor black level (raw value ≤ black offset), producing a
+    zero or near-zero reading that makes the channel's hue contribution undefined.
+    Patches with low but non-zero signal still carry valid hue information for HPPCC.
+
+    The white patch is always retained. Excluded patches remain in delta-E evaluation.
+    These indices are used to filter the HPPCC chromatic partition only; baseline and RPCC
+    models are always trained on all patches for numerical stability.
+    """
+    reliable, excluded = [], []
+    for i in range(normalized_rgb.shape[0]):
+        if i == white_index or np.all(normalized_rgb[i] > min_level):
+            reliable.append(i)
+        else:
+            excluded.append(i)
+    return np.array(reliable, dtype=int), np.array(excluded, dtype=int)
+
+
+def render_xyz_to_display(
+    xyz: np.ndarray,
+    scene_white_xyz: np.ndarray,
+    output_colorspace: str,
+) -> np.ndarray:
+    """Convert scene XYZ to display RGB with reverse Bradford adaptation to D65.
+
+    The HPPCC model maps camera RGB to XYZ expressed under the scene illuminant.
+    Direct XYZ→sRGB conversion (which assumes D65) would produce a colour-cast output
+    whenever the scene white differs from D65. This function first adapts the XYZ from
+    scene_white_xyz back to D65, then converts to output RGB.
+    """
+    scene_white = np.asarray(scene_white_xyz, dtype=np.float64)
+    adapted = (
+        bradford_adapt_xyz(xyz, scene_white, _D65_WHITE)
+        if not np.allclose(scene_white, _D65_WHITE, atol=1e-4)
+        else np.asarray(xyz, dtype=np.float64)
+    )
+    return xyz_to_output_rgb(adapted, output_colorspace)
 
 
 def reduce_cfa_values_to_rgb(values: tuple[int, int, int, int] | None, color_desc: str) -> np.ndarray | None:
@@ -211,6 +539,210 @@ def normalize_with_sensor_levels(
         raise ValueError("Sensor white levels must exceed black levels for all RGB channels.")
     normalized = (rgb - black_levels_rgb) / span
     return np.clip(normalized, 0.0, None)
+
+
+def _extract_patch_pixels(
+    image: np.ndarray,
+    center: np.ndarray,
+    patch_size: tuple[int, int],
+) -> np.ndarray:
+    width, height = patch_size
+    x, y = [int(round(v)) for v in center]
+    half_w = width // 2
+    half_h = height // 2
+    top = max(0, y - half_h)
+    bottom = min(image.shape[0], y + half_h)
+    left = max(0, x - half_w)
+    right = min(image.shape[1], x + half_w)
+    return np.asarray(image[top:bottom, left:right, :3], dtype=np.float64)
+
+
+def estimate_noise_profile_from_patches(
+    normalized_image: np.ndarray,
+    absolute_patch_centers: np.ndarray,
+    patch_size: tuple[int, int],
+    neutral_indices: np.ndarray,
+    min_value: float = 0.01,
+) -> dict[str, object]:
+    neutral_indices = np.asarray(neutral_indices, dtype=int)
+    patch_means = []
+    patch_variances = []
+    patch_payload = []
+
+    for patch_index in neutral_indices:
+        patch = _extract_patch_pixels(normalized_image, absolute_patch_centers[patch_index], patch_size)
+        if patch.size == 0:
+            continue
+        pixels = patch.reshape(-1, 3)
+        mean_rgb = np.mean(pixels, axis=0)
+        if np.any(mean_rgb <= min_value) or np.any(mean_rgb >= 0.99):
+            continue
+        variance_rgb = np.var(pixels, axis=0, ddof=1)
+        patch_means.append(mean_rgb)
+        patch_variances.append(variance_rgb)
+        patch_payload.append(
+            {
+                "patch_index": int(patch_index),
+                "mean_rgb": mean_rgb.tolist(),
+                "variance_rgb": variance_rgb.tolist(),
+            }
+        )
+
+    if not patch_means:
+        sigma_rgb = np.array([0.003, 0.003, 0.003], dtype=np.float64)
+        variance_rgb = sigma_rgb**2
+        return {
+            "sigma_rgb": sigma_rgb.tolist(),
+            "variance_rgb": variance_rgb.tolist(),
+            "patch_count": 0,
+            "patches": [],
+        }
+
+    means = np.asarray(patch_means, dtype=np.float64)
+    variances = np.asarray(patch_variances, dtype=np.float64)
+    sigma_rgb = np.sqrt(np.median(np.clip(variances, 0.0, None), axis=0))
+    return {
+        "sigma_rgb": sigma_rgb.tolist(),
+        "variance_rgb": np.median(np.clip(variances, 0.0, None), axis=0).tolist(),
+        "patch_count": int(len(patch_payload)),
+        "patches": patch_payload,
+    }
+
+
+def denoise_linear_rgb_bilateral(
+    normalized_image: np.ndarray,
+    noise_profile: dict[str, object],
+    *,
+    strength: float,
+    diameter: int,
+    sigma_space: float,
+) -> np.ndarray:
+    if diameter <= 0 or strength <= 0.0:
+        return np.asarray(normalized_image, dtype=np.float64).copy()
+
+    sigma_rgb = np.asarray(noise_profile["sigma_rgb"], dtype=np.float64)
+    image = np.asarray(normalized_image, dtype=np.float64)
+    denoised = np.empty_like(image, dtype=np.float32)
+    for channel_index in range(3):
+        sigma_color = max(1e-6, float(strength * sigma_rgb[channel_index]))
+        denoised[..., channel_index] = cv2.bilateralFilter(
+            image[..., channel_index].astype(np.float32),
+            d=int(diameter),
+            sigmaColor=sigma_color,
+            sigmaSpace=float(sigma_space),
+        )
+    return np.asarray(denoised, dtype=np.float64)
+
+
+def _haar_dwt2(image: np.ndarray) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray, np.ndarray], tuple[int, int]]:
+    height, width = image.shape
+    even_height = height // 2 * 2
+    even_width = width // 2 * 2
+    base = np.asarray(image[:even_height, :even_width], dtype=np.float64)
+    a = base[0::2, 0::2]
+    b = base[0::2, 1::2]
+    c = base[1::2, 0::2]
+    d = base[1::2, 1::2]
+    ll = (a + b + c + d) * 0.5
+    lh = (a - b + c - d) * 0.5
+    hl = (a + b - c - d) * 0.5
+    hh = (a - b - c + d) * 0.5
+    return ll, (lh, hl, hh), image.shape
+
+
+def _haar_idwt2(
+    ll: np.ndarray,
+    bands: tuple[np.ndarray, np.ndarray, np.ndarray],
+    original_shape: tuple[int, int],
+) -> np.ndarray:
+    lh, hl, hh = bands
+    height_half, width_half = ll.shape
+    a = (ll + lh + hl + hh) * 0.5
+    b = (ll - lh + hl - hh) * 0.5
+    c = (ll + lh - hl - hh) * 0.5
+    d = (ll - lh - hl + hh) * 0.5
+    reconstructed = np.zeros((height_half * 2, width_half * 2), dtype=np.float64)
+    reconstructed[0::2, 0::2] = a
+    reconstructed[0::2, 1::2] = b
+    reconstructed[1::2, 0::2] = c
+    reconstructed[1::2, 1::2] = d
+    if reconstructed.shape != original_shape:
+        padded = np.zeros(original_shape, dtype=np.float64)
+        padded[: reconstructed.shape[0], : reconstructed.shape[1]] = reconstructed
+        return padded
+    return reconstructed
+
+
+def _soft_threshold(values: np.ndarray, threshold: float) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    return np.sign(values) * np.maximum(np.abs(values) - threshold, 0.0)
+
+
+def _denoise_channel_wavelet(
+    channel: np.ndarray,
+    sigma: float,
+    *,
+    strength: float,
+    levels: int = 2,
+) -> np.ndarray:
+    channel = np.asarray(channel, dtype=np.float64)
+    approximation = channel
+    pyramid: list[tuple[tuple[np.ndarray, np.ndarray, np.ndarray], tuple[int, int]]] = []
+
+    for _ in range(levels):
+        if min(approximation.shape) < 2:
+            break
+        approximation, detail_bands, original_shape = _haar_dwt2(approximation)
+        pyramid.append((detail_bands, original_shape))
+
+    for level in reversed(range(len(pyramid))):
+        detail_bands, original_shape = pyramid[level]
+        scale_sigma = float(sigma) / (2**level)
+        denoised_bands = []
+        for band in detail_bands:
+            observed_variance = float(np.var(band))
+            signal_sigma = np.sqrt(max(observed_variance - scale_sigma**2, 0.0))
+            if signal_sigma > 0.0:
+                threshold = float(strength) * (scale_sigma**2 / max(signal_sigma, 1e-8))
+            else:
+                threshold = float(strength) * scale_sigma
+            denoised_bands.append(_soft_threshold(band, threshold))
+        approximation = _haar_idwt2(approximation, tuple(denoised_bands), original_shape)
+
+    return np.clip(approximation, 0.0, None)
+
+
+def denoise_linear_rgb(
+    normalized_image: np.ndarray,
+    noise_profile: dict[str, object],
+    *,
+    method: str,
+    strength: float,
+    diameter: int,
+    sigma_space: float,
+) -> np.ndarray:
+    if method == "bilateral":
+        return denoise_linear_rgb_bilateral(
+            normalized_image,
+            noise_profile,
+            strength=strength,
+            diameter=diameter,
+            sigma_space=sigma_space,
+        )
+    if method != "wavelet":
+        raise ValueError(f"Unsupported denoise method: {method}")
+
+    image = np.asarray(normalized_image, dtype=np.float64)
+    sigma_rgb = np.asarray(noise_profile["sigma_rgb"], dtype=np.float64)
+    denoised = np.empty_like(image, dtype=np.float64)
+    for channel_index in range(3):
+        denoised[..., channel_index] = _denoise_channel_wavelet(
+            image[..., channel_index],
+            float(sigma_rgb[channel_index]),
+            strength=strength,
+            levels=2,
+        )
+    return denoised
 
 
 def _apply_display_transfer(rgb_linear: np.ndarray) -> np.ndarray:
@@ -365,7 +897,7 @@ def hppcc_model_from_dict(payload: dict[str, object]) -> HPPCCModel:
 
 def save_analysis_result(output_dir: Path, raw_path: Path, payload: dict[str, object]) -> Path:
     output_dir.mkdir(exist_ok=True)
-    output_path = output_dir / f"result_{raw_path.stem}.json"
+    output_path = output_dir / f"{raw_path.stem}_correction.json"
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return output_path
 
@@ -417,13 +949,23 @@ def summarize_model(
     use_hppcc_blending: bool = False,
     hppcc_blend_width: float = 0.15,
     perform_nonlinear_corrections: bool = True,
+    reference_chroma: np.ndarray | None = None,
+    reliable_patch_indices: np.ndarray | None = None,
 ) -> dict[str, object]:
-    training_indices = np.arange(measured_rgb.shape[0], dtype=int)
-    measured_rgb_train = measured_rgb[training_indices]
-    reference_xyz_train = reference_xyz[training_indices]
-    white_index_train = int(np.where(training_indices == white_index)[0][0])
-    index_map = {int(index): position for position, index in enumerate(training_indices)}
-    chromatic_indices_train = np.array([index_map[int(index)] for index in chromatic_indices], dtype=int)
+    # Baseline and RPCC train on all patches for numerical stability.
+    all_indices = np.arange(measured_rgb.shape[0], dtype=int)
+    measured_rgb_train = measured_rgb[all_indices]
+    reference_xyz_train = reference_xyz[all_indices]
+    white_index_train = white_index
+
+    # HPPCC chromatic partition uses only reliable patches to avoid noise-floor contamination.
+    if reliable_patch_indices is not None:
+        reliable_set = set(int(i) for i in reliable_patch_indices)
+        chromatic_indices_train = np.array(
+            [ci for ci in chromatic_indices if int(ci) in reliable_set], dtype=int
+        )
+    else:
+        chromatic_indices_train = np.asarray(chromatic_indices, dtype=int)
 
     baseline = src_module.fit_white_preserving_3x3(
         measured_rgb_train,
@@ -432,6 +974,38 @@ def summarize_model(
     )
     baseline_xyz = baseline.predict(measured_rgb)
     baseline_de00 = delta_e00_summary(src_module, baseline_xyz, reference_xyz, illuminant_white)
+
+    rpcc = src_module.fit_rpcc(
+        measured_rgb_train,
+        reference_xyz_train,
+        white_index=white_index_train,
+    )
+    rpcc_xyz = rpcc.predict(measured_rgb)
+    rpcc_de00 = delta_e00_summary(src_module, rpcc_xyz, reference_xyz, illuminant_white)
+
+    result = {
+        "baseline": baseline,
+        "baseline_de00": baseline_de00,
+        "rpcc": rpcc,
+        "rpcc_de00": rpcc_de00,
+    }
+
+    if reference_chroma is not None:
+        result["baseline_chroma_error"] = chroma_error_summary(src_module, baseline_xyz, illuminant_white, reference_chroma)
+        result["rpcc_chroma_error"] = chroma_error_summary(src_module, rpcc_xyz, illuminant_white, reference_chroma)
+
+    if len(chromatic_indices_train) < 2:
+        # Too few reliable chromatic patches — HPPCC cannot be fit; fall back to RPCC.
+        result["hppcc"] = rpcc
+        result["hppcc_de00"] = rpcc_de00
+        if reference_chroma is not None:
+            result["hppcc_chroma_error"] = result["rpcc_chroma_error"]
+        if perform_nonlinear_corrections:
+            result["hppcc_rpcc"] = rpcc
+            result["hppcc_rpcc_de00"] = rpcc_de00
+            if reference_chroma is not None:
+                result["hppcc_rpcc_chroma_error"] = result["rpcc_chroma_error"]
+        return result
 
     hppcc = src_module.fit_hppcc(
         measured_rgb_train,
@@ -443,13 +1017,11 @@ def summarize_model(
     )
     hppcc_xyz = predict_hppcc(hppcc, measured_rgb, use_blending=use_hppcc_blending, blend_width=hppcc_blend_width)
     hppcc_de00 = delta_e00_summary(src_module, hppcc_xyz, reference_xyz, illuminant_white)
+    result["hppcc"] = hppcc
+    result["hppcc_de00"] = hppcc_de00
 
-    result = {
-        "baseline": baseline,
-        "baseline_de00": baseline_de00,
-        "hppcc": hppcc,
-        "hppcc_de00": hppcc_de00,
-    }
+    if reference_chroma is not None:
+        result["hppcc_chroma_error"] = chroma_error_summary(src_module, hppcc_xyz, illuminant_white, reference_chroma)
 
     if perform_nonlinear_corrections:
         hppcc_rpcc = src_module.fit_hppcc_rpcc(
@@ -466,6 +1038,10 @@ def summarize_model(
         hppcc_rpcc_de00 = delta_e00_summary(src_module, hppcc_rpcc_xyz, reference_xyz, illuminant_white)
         result["hppcc_rpcc"] = hppcc_rpcc
         result["hppcc_rpcc_de00"] = hppcc_rpcc_de00
+        if reference_chroma is not None:
+            result["hppcc_rpcc_chroma_error"] = chroma_error_summary(
+                src_module, hppcc_rpcc_xyz, illuminant_white, reference_chroma
+            )
 
     return result
 

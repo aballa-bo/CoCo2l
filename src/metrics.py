@@ -24,8 +24,8 @@ def hue_angle_from_rgb(rgb: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 def xyz_to_lab(xyz: np.ndarray, white_xyz: np.ndarray) -> np.ndarray:
     xyz = np.asarray(xyz, dtype=np.float64)
     white_xyz = np.asarray(white_xyz, dtype=np.float64)
-    if white_xyz.shape != (3,):
-        raise ValueError("white_xyz must have shape (3,).")
+    if white_xyz.shape != (3,) and white_xyz.shape != xyz.shape:
+        raise ValueError("white_xyz must have shape (3,) or match xyz shape.")
 
     xyz_n = xyz / white_xyz
     delta = 6.0 / 29.0
@@ -38,6 +38,34 @@ def xyz_to_lab(xyz: np.ndarray, white_xyz: np.ndarray) -> np.ndarray:
     a = 500.0 * (f[..., 0] - f[..., 1])
     b = 200.0 * (f[..., 1] - f[..., 2])
     return np.stack([l, a, b], axis=-1)
+
+
+def lab_to_xyz(lab: np.ndarray, white_xyz: np.ndarray) -> np.ndarray:
+    lab = np.asarray(lab, dtype=np.float64)
+    white_xyz = np.asarray(white_xyz, dtype=np.float64)
+    if white_xyz.shape != (3,) and white_xyz.shape != lab.shape:
+        raise ValueError("white_xyz must have shape (3,) or match lab shape.")
+
+    delta = 6.0 / 29.0
+    linear_scale = 3.0 * delta * delta
+
+    fy = (lab[..., 0] + 16.0) / 116.0
+    fx = fy + lab[..., 1] / 500.0
+    fz = fy - lab[..., 2] / 200.0
+    f = np.stack([fx, fy, fz], axis=-1)
+    xyz_n = np.where(f > delta, f**3, linear_scale * (f - 4.0 / 29.0))
+    return xyz_n * white_xyz
+
+
+def xyy_to_xyz(xyy: np.ndarray) -> np.ndarray:
+    xyy = np.asarray(xyy, dtype=np.float64)
+    x = xyy[..., 0]
+    y = xyy[..., 1]
+    Y = xyy[..., 2]
+    safe_y = np.where(np.abs(y) < 1e-12, 1e-12, y)
+    X = x * Y / safe_y
+    Z = (1.0 - x - y) * Y / safe_y
+    return np.stack([X, Y, Z], axis=-1)
 
 
 def delta_e_2000(lab1: np.ndarray, lab2: np.ndarray) -> np.ndarray:
@@ -105,4 +133,3 @@ def delta_e_2000(lab1: np.ndarray, lab2: np.ndarray) -> np.ndarray:
     d_c_term = dc / s_c
     d_h_term = d_hp / s_h
     return np.sqrt(d_l_term**2 + d_c_term**2 + d_h_term**2 + r_t * d_c_term * d_h_term)
-
