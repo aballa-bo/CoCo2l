@@ -223,6 +223,36 @@ def reformat_scene_image(image: np.ndarray) -> np.ndarray:
     return reformat_image(image, working_width)
 
 
+def _linear_to_display_uint8(linear_rgb: np.ndarray) -> np.ndarray:
+    """Convert a linear float image to gamma-corrected uint8 for segmentation.
+
+    Uses the 99th percentile as white point to be robust against hot pixels.
+    Applies sRGB transfer function so that the detector sees natural-looking contrast.
+    """
+    img = np.asarray(linear_rgb, dtype=np.float64)
+    img = np.clip(img, 0.0, None)
+    p99 = np.percentile(img, 99)
+    if p99 > 0:
+        img = img / p99
+    img = np.clip(img, 0.0, 1.0)
+    # sRGB gamma (IEC 61966-2-1)
+    img = np.where(
+        img <= 0.0031308,
+        12.92 * img,
+        1.055 * np.power(np.maximum(img, 0.0031308), 1.0 / 2.4) - 0.055,
+    )
+    return (np.clip(img, 0.0, 1.0) * 255).round().astype(np.uint8)
+
+
+def _apply_clahe(uint8_rgb: np.ndarray, clip_limit: float = 3.0) -> np.ndarray:
+    """Apply CLAHE on the L channel of LAB to enhance local contrast."""
+    lab = cv2.cvtColor(uint8_rgb, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2RGB)
+
+
 def make_scene_preview(
     image: np.ndarray,
     quadrilateral: np.ndarray,
@@ -382,17 +412,42 @@ def make_json_grid_preview(swatch_colours: np.ndarray) -> np.ndarray:
     return canvas
 
 
+_DETECTION_WORKING_WIDTHS = [1440, 960, 720, 480]
+
+
+def _try_detect(image: np.ndarray) -> tuple[object, np.ndarray] | tuple[None, None]:
+    """Try detection across multiple working widths and preprocessing variants.
+
+    For each attempt, scene_image and detection_image share the same resolution
+    so returned quadrilateral coordinates are always in scene_image space.
+    Tries standard gamma first, then CLAHE-enhanced, at each width.
+    Returns (detection, scene_image) on success, (None, None) on failure.
+    """
+    for width in _DETECTION_WORKING_WIDTHS:
+        scene_at_width = reformat_image(image, width)
+        for preprocess in (_linear_to_display_uint8, lambda s: _apply_clahe(_linear_to_display_uint8(s))):
+            detection_at_width = preprocess(scene_at_width)
+            detections = detect_colour_checkers_segmentation(
+                detection_at_width, additional_data=True, working_width=width
+            )
+            if detections:
+                return detections[0], scene_at_width
+    return None, None
+
+
 def detect_and_orient_colorchecker(
     image: np.ndarray,
     *,
     white_index: int,
 ) -> ColorCheckerDetectionResult:
-    scene_image = reformat_scene_image(image)
-    detections = detect_colour_checkers_segmentation(image, additional_data=True)
-    if not detections:
+    # The detector receives a gamma-corrected uint8 image at the trial working_width
+    # so segmentation finds natural contrast regardless of sensor dynamic range.
+    # scene_image is kept linear and at the same resolution as the successful detection,
+    # so patch coordinates are always consistent.
+    detection, scene_image = _try_detect(image)
+    if detection is None:
         raise RuntimeError("No ColorChecker detected in the image.")
 
-    detection = detections[0]
     relative_patch_centers = recover_relative_patch_centers(detection.swatch_masks)
     measurement_patch_size = estimate_measurement_patch_size_from_masks(detection.swatch_masks)
     preview_patch_size = estimate_patch_size_from_centers(

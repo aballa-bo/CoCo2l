@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-RAW_EXTENSIONS = {".nef", ".cr2", ".cr3", ".arw", ".raf", ".dng", ".tif", ".tiff"}
+RAW_EXTENSIONS = {".nef", ".cr2", ".cr3", ".arw", ".raf", ".dng"}
 
 FLOAT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 
