@@ -363,11 +363,19 @@ def find_raw_path(image_dir: Path) -> Path:
     return candidates[0]
 
 
-def find_raw_paths(image_dir: Path) -> list[Path]:
+def find_raw_paths(image_dir: Path, *, recursive: bool = False) -> list[Path]:
+    glob = "**/{}" if recursive else "{}"
     candidates = []
-    for pattern in ("*.NEF", "*.CR2", "*.CR3", "*.ARW", "*.RAF", "*.DNG"):
-        candidates.extend(sorted(image_dir.glob(pattern)))
-    return candidates
+    for pattern in ("*.NEF", "*.CR2", "*.CR3", "*.ARW", "*.RAF", "*.DNG",
+                    "*.nef", "*.cr2", "*.cr3", "*.arw", "*.raf", "*.dng"):
+        candidates.extend(image_dir.glob(glob.format(pattern)))
+    seen: set[Path] = set()
+    result = []
+    for p in sorted(candidates):
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
 
 
 def _load_reference_triplets(path: Path, key: str) -> np.ndarray:
@@ -743,6 +751,37 @@ def denoise_linear_rgb(
             levels=2,
         )
     return denoised
+
+
+def sharpen_adaptive_rgb(
+    normalized_image: np.ndarray,
+    noise_profile: dict[str, object] | None,
+    *,
+    amount: float,
+    radius: float,
+    threshold: float,
+) -> np.ndarray:
+    image = np.asarray(normalized_image, dtype=np.float64)
+    if amount <= 0.0 or radius <= 0.0 or image.size == 0:
+        return image.copy()
+
+    ksize = max(3, int(round(radius * 6.0)) | 1)
+    blurred = cv2.GaussianBlur(image.astype(np.float32), (ksize, ksize), float(radius))
+    detail = image - np.asarray(blurred, dtype=np.float64)
+
+    if noise_profile is not None and threshold > 0.0:
+        sigma_rgb = np.asarray(noise_profile.get("sigma_rgb", [0.0, 0.0, 0.0]), dtype=np.float64)
+        mask = np.zeros_like(detail)
+        for channel_index in range(3):
+            sigma_threshold = max(float(sigma_rgb[channel_index]) * float(threshold), 1e-12)
+            mask[..., channel_index] = np.clip(
+                (np.abs(detail[..., channel_index]) - sigma_threshold) / sigma_threshold,
+                0.0,
+                1.0,
+            )
+        detail = detail * mask
+
+    return np.clip(image + float(amount) * detail, 0.0, None)
 
 
 def _apply_display_transfer(rgb_linear: np.ndarray) -> np.ndarray:

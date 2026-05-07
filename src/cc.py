@@ -1,4 +1,5 @@
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import replace as _dc_replace
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import src
 from src.colorchecker import CLASSIC_24_PATCH_NAMES
 from src.cli_parser import build_parser
+from src.lens import try_undistort
 from src.colorchecker_detector import (
     detect_and_orient_colorchecker,
     make_scene_preview,
@@ -23,6 +25,7 @@ from src.config import (
     DENOISE_DIAMETER,
     DENOISE_SIGMA_SPACE,
     DENOISE_STRENGTH,
+    ENABLE_ADAPTIVE_SHARPEN,
     ENABLE_PATCH_VARIANCE_DENOISE,
     HPPCC_BLEND_WIDTH,
     HPPCC_REGION_CANDIDATES,
@@ -34,6 +37,9 @@ from src.config import (
     REFERENCE_ILLUMINANT,
     REFERENCE_PATH,
     REFERENCE_SPACE,
+    SHARPEN_AMOUNT,
+    SHARPEN_RADIUS,
+    SHARPEN_THRESHOLD,
     SHOW_DETECTION_PREVIEW,
     SHOW_DEVELOPED_IMAGE_PREVIEW,
     STANDARD_WHITES,
@@ -93,6 +99,7 @@ from src.utils import (
     rpcc_model_to_dict,
     save_analysis_result,
     select_scene_white_source,
+    sharpen_adaptive_rgb,
     summarize_model,
     to_uint8_image,
     get_icc_profile_bytes,
@@ -113,6 +120,10 @@ PROCESS_SETTING_NAMES = (
     "denoise_strength",
     "denoise_diameter",
     "denoise_sigma_space",
+    "adaptive_sharpen",
+    "sharpen_amount",
+    "sharpen_radius",
+    "sharpen_threshold",
     "use_metadata_rgb_xyz_baseline",
     "use_hppcc_blending",
     "hppcc_blend_width",
@@ -150,7 +161,14 @@ def run_analysis(args) -> None:
     reference_chroma = load_reference_chroma(args.reference_path)
 
     raw = src.load_raw_linear_rgb(raw_path)
-    detection = detect_and_orient_colorchecker(raw.rgb, white_index=args.white_index)
+    undistorted_rgb, undistort_info = try_undistort(raw.rgb, raw_path)
+    if undistort_info is not None:
+        raw = _dc_replace(raw, rgb=undistorted_rgb)
+        print(f"Lens undistortion applied: {undistort_info['lens_model']} "
+              f"@ {undistort_info['focal_length_mm']:.1f} mm")
+    else:
+        print("Lens undistortion skipped: camera/lens not found in Lensfun database.")
+    detection = detect_and_orient_colorchecker(raw.rgb, white_index=args.white_index, roi=getattr(args, "roi", None))
     save_detection_overlay_preview(args.analysis_dir, make_scene_preview, detection)
     sensor_black_levels_rgb = reduce_cfa_values_to_rgb(raw.black_level_per_channel, raw.color_desc)
     sensor_white_levels_rgb = reduce_cfa_values_to_rgb(raw.camera_white_level_per_channel, raw.color_desc)
@@ -183,13 +201,14 @@ def run_analysis(args) -> None:
         sensor_black_levels_rgb,
         sensor_white_levels_rgb,
     )
-    if args.patch_variance_denoise:
+    if args.patch_variance_denoise or args.adaptive_sharpen:
         noise_profile = estimate_noise_profile_from_patches(
             scene_linear_rgb,
             detection.absolute_patch_centers,
             detection.measurement_patch_size,
             neutral_indices,
         )
+    if args.patch_variance_denoise:
         scene_linear_rgb = denoise_linear_rgb(
             scene_linear_rgb,
             noise_profile,
@@ -326,6 +345,14 @@ def run_analysis(args) -> None:
             diameter=int(args.denoise_diameter),
             sigma_space=float(args.denoise_sigma_space),
         )
+    if args.adaptive_sharpen:
+        normalized_full_rgb = sharpen_adaptive_rgb(
+            normalized_full_rgb,
+            noise_profile,
+            amount=float(args.sharpen_amount),
+            radius=float(args.sharpen_radius),
+            threshold=float(args.sharpen_threshold),
+        )
     if args.perform_nonlinear_corrections:
         corrected_full_xyz = predict_hppcc_rpcc(
             best["hppcc_rpcc"],
@@ -353,15 +380,7 @@ def run_analysis(args) -> None:
         copy_exif_from_raw(raw_path, analysis_output_path)
     except RuntimeError as exc:
         print(f"Warning: {exc}")
-    rpcc_full_xyz = best["rpcc"].predict(normalized_full_rgb)
-    rpcc_full_output_rgb = render_xyz_to_display(rpcc_full_xyz, scene_white_xyz, args.output_colorspace)
-    rpcc_full_uint8 = to_uint8_image(rpcc_full_output_rgb)
-    rpcc_output_path = args.process_dir / f"{raw_path.stem}_analysis_rpcc{ext}"
-    save_named_corrected_image(rpcc_output_path, rpcc_full_uint8, icc_bytes)
-    try:
-        copy_exif_from_raw(raw_path, rpcc_output_path)
-    except RuntimeError as exc:
-        print(f"Warning: {exc}")
+    print(f"Analysis image written to: {analysis_output_path}")
     models_payload: dict[str, object] = {
         "baseline": linear_model_to_dict(best["baseline"]),
         "rpcc": rpcc_model_to_dict(best["rpcc"]),
@@ -388,12 +407,18 @@ def run_analysis(args) -> None:
                 "denoise_strength": float(args.denoise_strength),
                 "denoise_diameter": int(args.denoise_diameter),
                 "denoise_sigma_space": float(args.denoise_sigma_space),
+                "adaptive_sharpen": bool(args.adaptive_sharpen),
+                "sharpen_amount": float(args.sharpen_amount),
+                "sharpen_radius": float(args.sharpen_radius),
+                "sharpen_threshold": float(args.sharpen_threshold),
                 "use_metadata_rgb_xyz_baseline": bool(args.use_metadata_rgb_xyz_baseline),
                 "use_hppcc_blending": bool(args.use_hppcc_blending),
                 "hppcc_blend_width": float(args.hppcc_blend_width),
                 "perform_nonlinear_corrections": bool(args.perform_nonlinear_corrections),
                 "output_format": args.output_format,
                 "output_colorspace": args.output_colorspace,
+                "undistort": undistort_info if undistort_info is not None
+                             else {"applied": False},
             },
             "selection": {"selected_k_regions": selected_k_regions},
             "diagnostics": {
@@ -458,7 +483,7 @@ def run_process(args) -> None:
     if use_nonlinear and "hppcc_rpcc" not in models_payload:
         raise ValueError("The saved analysis result does not contain an HPPCC+RPCC model, so --perform-nonlinear-corrections cannot be enabled.")
 
-    raw_paths = find_raw_paths(args.folder_to_process)
+    raw_paths = find_raw_paths(args.folder_to_process, recursive=bool(getattr(args, "recursive", False)))
     if not raw_paths:
         raise FileNotFoundError(f"No RAW file found in {args.folder_to_process}")
 
@@ -509,6 +534,13 @@ def _process_single_raw(
     scene_white_xyz = np.asarray(settings["scene_white_xyz"], dtype=np.float64)
     output_paths: list[Path] = []
     raw = src.load_raw_linear_rgb(raw_path)
+    if settings.get("undistort", {}).get("applied", False):
+        undistorted_rgb, undistort_info = try_undistort(raw.rgb, raw_path)
+        if undistort_info is not None:
+            raw = _dc_replace(raw, rgb=undistorted_rgb)
+        else:
+            print(f"Warning: lens undistortion was applied during analysis but could not be "
+                  f"applied to {raw_path.name} (camera/lens not found in Lensfun database).")
     sensor_black_levels_rgb = reduce_cfa_values_to_rgb(raw.black_level_per_channel, raw.color_desc)
     sensor_white_levels_rgb = reduce_cfa_values_to_rgb(raw.camera_white_level_per_channel, raw.color_desc)
     if sensor_black_levels_rgb is None or sensor_white_levels_rgb is None:
@@ -528,6 +560,14 @@ def _process_single_raw(
             strength=float(settings.get("denoise_strength", DENOISE_STRENGTH)),
             diameter=int(settings.get("denoise_diameter", DENOISE_DIAMETER)),
             sigma_space=float(settings.get("denoise_sigma_space", DENOISE_SIGMA_SPACE)),
+        )
+    if bool(settings.get("adaptive_sharpen", False)):
+        normalized_full_rgb = sharpen_adaptive_rgb(
+            normalized_full_rgb,
+            noise_profile,
+            amount=float(settings.get("sharpen_amount", SHARPEN_AMOUNT)),
+            radius=float(settings.get("sharpen_radius", SHARPEN_RADIUS)),
+            threshold=float(settings.get("sharpen_threshold", SHARPEN_THRESHOLD)),
         )
     extension = output_extension(settings.get("output_format", OUTPUT_FORMAT))
     icc_profile_bytes = get_icc_profile_bytes(settings.get("output_colorspace", OUTPUT_COLORSPACE))
@@ -555,8 +595,18 @@ def _process_single_raw(
 
 
 def main(argv: list[str] | None = None) -> None:
+    import sys as _sys
+    effective_argv = argv if argv is not None else _sys.argv[1:]
+    if not effective_argv:
+        # No arguments — launch the GUI
+        import sys
+        from pathlib import Path as _Path
+        sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+        from app import main as gui_main
+        gui_main()
+        return
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(effective_argv)
     if args.command == "analyze":
         run_analysis(args)
         return

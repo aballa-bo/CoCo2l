@@ -439,11 +439,15 @@ def detect_and_orient_colorchecker(
     image: np.ndarray,
     *,
     white_index: int,
+    roi: tuple[int, int, int, int] | None = None,
 ) -> ColorCheckerDetectionResult:
     # The detector receives a gamma-corrected uint8 image at the trial working_width
     # so segmentation finds natural contrast regardless of sensor dynamic range.
     # scene_image is kept linear and at the same resolution as the successful detection,
     # so patch coordinates are always consistent.
+    if roi is not None:
+        x1, y1, x2, y2 = roi
+        image = image[y1:y2, x1:x2]
     detection, scene_image = _try_detect(image)
     if detection is None:
         raise RuntimeError("No ColorChecker detected in the image.")

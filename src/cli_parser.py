@@ -11,6 +11,7 @@ from src.config import (
     DENOISE_DIAMETER,
     DENOISE_SIGMA_SPACE,
     DENOISE_STRENGTH,
+    ENABLE_ADAPTIVE_SHARPEN,
     ENABLE_PATCH_VARIANCE_DENOISE,
     HPPCC_BLEND_WIDTH,
     HPPCC_REGION_CANDIDATES,
@@ -23,6 +24,9 @@ from src.config import (
     REFERENCE_PATH,
     REFERENCE_SPACE,
     SCENE_WHITE_SOURCE,
+    SHARPEN_AMOUNT,
+    SHARPEN_RADIUS,
+    SHARPEN_THRESHOLD,
     SHOW_DETECTION_PREVIEW,
     SHOW_DEVELOPED_IMAGE_PREVIEW,
     STANDARD_WHITES,
@@ -135,6 +139,30 @@ def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defau
         help="Spatial sigma for bilateral denoising in pixels.",
     )
     parser.add_argument(
+        "--adaptive-sharpen",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_ADAPTIVE_SHARPEN if use_defaults else None,
+        help="Apply adaptive unsharp mask gated by the patch-derived noise profile.",
+    )
+    parser.add_argument(
+        "--sharpen-amount",
+        type=float,
+        default=SHARPEN_AMOUNT if use_defaults else None,
+        help="Strength multiplier on the unsharp-mask detail layer.",
+    )
+    parser.add_argument(
+        "--sharpen-radius",
+        type=float,
+        default=SHARPEN_RADIUS if use_defaults else None,
+        help="Gaussian sigma (pixels) used to build the unsharp-mask blur.",
+    )
+    parser.add_argument(
+        "--sharpen-threshold",
+        type=float,
+        default=SHARPEN_THRESHOLD if use_defaults else None,
+        help="Multiplier of per-channel noise sigma below which detail is suppressed.",
+    )
+    parser.add_argument(
         "--use-metadata-rgb-xyz-baseline",
         action=argparse.BooleanOptionalAction,
         default=USE_METADATA_RGB_XYZ_BASELINE if use_defaults else None,
@@ -184,6 +212,20 @@ def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defau
     )
 
 
+def parse_roi(value: str) -> tuple[int, int, int, int]:
+    """Parse --roi as 'x1,y1,x2,y2' pixel coordinates."""
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("--roi must be four integers: x1,y1,x2,y2")
+    try:
+        x1, y1, x2, y2 = [int(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--roi values must be integers") from exc
+    if x2 <= x1 or y2 <= y1:
+        raise argparse.ArgumentTypeError("--roi requires x2>x1 and y2>y1")
+    return x1, y1, x2, y2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="HPPCC RAW analyzer.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -192,14 +234,18 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--cc-image", type=Path, default=None, help="RAW file to analyze.")
     analyze.add_argument("--image-dir", type=Path, default=IMAGE_DIR, help="Directory used when --cc-image is omitted.")
     analyze.add_argument("--reference-path", type=Path, default=REFERENCE_PATH, help="Reference JSON path.")
-    analyze.add_argument("--analysis-dir", type=Path, default=ANALYSIS_DIR, help="Output directory for analysis files (overlays, JSON).")
-    analyze.add_argument("--process-dir", type=Path, default=PROCESS_DIR, help="Output directory for developed images.")
+    analyze.add_argument("--analysis-dir", type=Path, default=ANALYSIS_DIR, help="Output directory for analysis files (overlays, JSON). Pass the same path as --process-dir to collect all outputs in one folder.")
+    analyze.add_argument("--process-dir", type=Path, default=PROCESS_DIR, help="Output directory for the developed image. Pass the same path as --analysis-dir to collect all outputs in one folder.")
+    analyze.add_argument("--roi", type=parse_roi, default=None, metavar="x1,y1,x2,y2",
+                         help="Pixel crop applied to the RAW before color checker detection (e.g. 200,100,1800,1200).")
     _add_analysis_config_arguments(analyze, use_defaults=True)
 
     process = subparsers.add_parser("process", help="Process a folder of RAW files using a saved analysis result.")
     process.add_argument("result_json", type=Path, help="Path to <stem>_correction.json produced by analyze.")
     process.add_argument("folder_to_process", type=Path, help="Folder containing RAW files to process.")
     process.add_argument("--process-dir", type=Path, default=None, help="Output directory for developed images.")
+    process.add_argument("--recursive", action="store_true", default=False,
+                         help="Recurse into subdirectories when looking for RAW files.")
     process.add_argument(
         "--workers",
         type=int,

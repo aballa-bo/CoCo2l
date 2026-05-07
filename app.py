@@ -1,0 +1,1045 @@
+"""HPPCC GUI — PyQt6 interface for color correction analysis and processing."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QTabWidget,
+    QVBoxLayout, QHBoxLayout, QFormLayout,
+    QLabel, QLineEdit, QPushButton, QTextEdit,
+    QFileDialog, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox,
+    QRubberBand, QMessageBox, QGroupBox, QSizePolicy, QSplitter,
+    QDialog, QDialogButtonBox, QScrollArea,
+)
+from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal, QRect, QSize, QPoint, QEvent
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont, QAction
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+PYTHON = str(PROJECT_ROOT / ".venv" / "Scripts" / "python.exe")
+CC_SCRIPT = str(PROJECT_ROOT / "src" / "cc.py")
+
+_EXT_MAP = {"jpeg": ".jpg", "tif": ".tif", "png": ".png"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background RAW thumbnail loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RawPreviewLoader(QThread):
+    ready = pyqtSignal(np.ndarray, int, int)   # rgb_uint8, orig_w, orig_h
+    failed = pyqtSignal(str)
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self._path = path
+
+    def run(self) -> None:
+        try:
+            import rawpy  # type: ignore
+            with rawpy.imread(self._path) as raw:
+                orig_h, orig_w = raw.raw_image_visible.shape[:2]
+                params = rawpy.Params(
+                    use_camera_wb=True,
+                    half_size=True,
+                    output_color=rawpy.ColorSpace.sRGB,
+                    output_bps=8,
+                    no_auto_bright=False,
+                    bright=1.0,
+                    gamma=(2.222, 4.5),
+                )
+                rgb = raw.postprocess(params=params)
+            self.ready.emit(rgb, orig_w, orig_h)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Zoomable preview base — QScrollArea + inner QLabel, mouse-wheel zoom,
+# scroll-position signals for cross-preview synchronization
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ZoomableImagePreview(QWidget):
+    zoom_changed = pyqtSignal(float)
+    scroll_changed = pyqtSignal(float, float)   # h_norm, v_norm in [0, 1]
+
+    MIN_ZOOM = 0.5
+    MAX_ZOOM = 32.0
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumSize(200, 160)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setStyleSheet("background:#1a1a1a; border:1px solid #555;")
+
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(False)
+        self._scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._scroll.viewport().setStyleSheet("background:#1a1a1a;")
+
+        self._inner = QLabel()
+        self._inner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._inner.setStyleSheet("background:#1a1a1a; color:#ccc;")
+        self._inner.setWordWrap(True)
+        self._scroll.setWidget(self._inner)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._scroll)
+
+        self._pixmap_src: QPixmap | None = None
+        self._orig_w = 1
+        self._orig_h = 1
+        self._zoom = 1.0   # 1.0 == fit-to-viewport
+        self._scale = 1.0  # current orig→screen pixel scale
+        self._suppress_sync = False
+
+        self._scroll.viewport().installEventFilter(self)
+        self._scroll.horizontalScrollBar().valueChanged.connect(self._on_scrolled)
+        self._scroll.verticalScrollBar().valueChanged.connect(self._on_scrolled)
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def setText(self, text: str) -> None:
+        self._inner.setText(text)
+        self._inner.setPixmap(QPixmap())
+        self._pixmap_src = None
+        self._inner.resize(self._scroll.viewport().size())
+
+    def set_zoom_external(self, zoom: float) -> None:
+        if self._pixmap_src is None:
+            return
+        zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(zoom)))
+        if abs(zoom - self._zoom) < 1e-3:
+            return
+        self._suppress_sync = True
+        try:
+            self._zoom = zoom
+            self._redraw()
+        finally:
+            self._suppress_sync = False
+
+    def set_scroll_external(self, h_norm: float, v_norm: float) -> None:
+        if self._pixmap_src is None:
+            return
+        self._suppress_sync = True
+        try:
+            hbar = self._scroll.horizontalScrollBar()
+            vbar = self._scroll.verticalScrollBar()
+            if hbar.maximum() > 0:
+                hbar.setValue(int(round(h_norm * hbar.maximum())))
+            if vbar.maximum() > 0:
+                vbar.setValue(int(round(v_norm * vbar.maximum())))
+        finally:
+            self._suppress_sync = False
+
+    # ── event handling ────────────────────────────────────────────────────
+
+    def eventFilter(self, obj, event):
+        if obj is self._scroll.viewport():
+            if event.type() == QEvent.Type.Wheel:
+                self._handle_wheel(event)
+                return True
+            if event.type() == QEvent.Type.Resize:
+                if self._pixmap_src is None:
+                    self._inner.resize(self._scroll.viewport().size())
+                else:
+                    self._redraw()
+        return super().eventFilter(obj, event)
+
+    # ── rendering ─────────────────────────────────────────────────────────
+
+    def _fit_scale(self) -> float:
+        v = self._scroll.viewport().size()
+        return min(max(v.width(), 1) / self._orig_w, max(v.height(), 1) / self._orig_h)
+
+    def _redraw(self) -> None:
+        if self._pixmap_src is None:
+            self._inner.resize(self._scroll.viewport().size())
+            return
+        scale = self._fit_scale() * self._zoom
+        self._scale = scale
+        sw = max(1, int(round(self._orig_w * scale)))
+        sh = max(1, int(round(self._orig_h * scale)))
+        scaled = self._pixmap_src.scaled(
+            sw, sh,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        canvas = self._compose_canvas(scaled, scale)
+        self._inner.setPixmap(canvas)
+        self._inner.resize(canvas.size())
+
+    def _compose_canvas(self, scaled_pixmap: QPixmap, scale: float) -> QPixmap:
+        return scaled_pixmap
+
+    # ── interaction ───────────────────────────────────────────────────────
+
+    def _handle_wheel(self, event) -> None:
+        if self._pixmap_src is None:
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.25 if delta > 0 else 1.0 / 1.25
+        new_zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, self._zoom * factor))
+        if abs(new_zoom - self._zoom) < 1e-3:
+            return
+
+        cursor = event.position()
+        hbar = self._scroll.horizontalScrollBar()
+        vbar = self._scroll.verticalScrollBar()
+        viewport_size = self._scroll.viewport().size()
+        old_off_x = max(0, (viewport_size.width() - self._inner.width()) // 2)
+        old_off_y = max(0, (viewport_size.height() - self._inner.height()) // 2)
+        old_scale = self._scale if self._scale > 0 else 1.0
+        img_x = (hbar.value() + cursor.x() - old_off_x) / old_scale
+        img_y = (vbar.value() + cursor.y() - old_off_y) / old_scale
+
+        self._zoom = new_zoom
+        self._redraw()
+
+        new_off_x = max(0, (viewport_size.width() - self._inner.width()) // 2)
+        new_off_y = max(0, (viewport_size.height() - self._inner.height()) // 2)
+        target_h = int(round(img_x * self._scale - cursor.x() + new_off_x))
+        target_v = int(round(img_y * self._scale - cursor.y() + new_off_y))
+        self._suppress_sync = True
+        try:
+            hbar.setValue(max(0, min(target_h, hbar.maximum())))
+            vbar.setValue(max(0, min(target_v, vbar.maximum())))
+        finally:
+            self._suppress_sync = False
+
+        self.zoom_changed.emit(self._zoom)
+        self._emit_scroll()
+        event.accept()
+
+    def _on_scrolled(self) -> None:
+        if self._suppress_sync:
+            return
+        self._emit_scroll()
+
+    def _emit_scroll(self) -> None:
+        hbar = self._scroll.horizontalScrollBar()
+        vbar = self._scroll.verticalScrollBar()
+        h_norm = hbar.value() / hbar.maximum() if hbar.maximum() > 0 else 0.0
+        v_norm = vbar.value() / vbar.maximum() if vbar.maximum() > 0 else 0.0
+        self.scroll_changed.emit(h_norm, v_norm)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RAW preview widget — rubber-band ROI selection + drag & drop
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ImagePreview(_ZoomableImagePreview):
+    roi_changed = pyqtSignal(int, int, int, int)   # x1,y1,x2,y2 in original pixels
+    roi_cleared = pyqtSignal()
+    file_dropped = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._inner.setText('Drop a RAW file here or use "Browse"')
+        self._inner.setCursor(Qt.CursorShape.CrossCursor)
+        self.setAcceptDrops(True)
+
+        self._roi: tuple[int, int, int, int] | None = None
+        self._rubber_band: QRubberBand | None = None
+        self._rb_origin = QPoint()
+
+        self._inner.installEventFilter(self)
+
+    def set_from_array(self, rgb: np.ndarray, orig_w: int, orig_h: int) -> None:
+        h, w = rgb.shape[:2]
+        img = QImage(rgb.tobytes(), w, h, 3 * w, QImage.Format.Format_RGB888)
+        self._pixmap_src = QPixmap.fromImage(img)
+        self._orig_w = int(orig_w)
+        self._orig_h = int(orig_h)
+        self._zoom = 1.0
+        self._inner.setText("")
+        self._redraw()
+        self._inner.setToolTip("Click and drag to select the color checker ROI")
+
+    def _compose_canvas(self, scaled_pixmap: QPixmap, scale: float) -> QPixmap:
+        if not self._roi:
+            return scaled_pixmap
+        canvas = QPixmap(scaled_pixmap)
+        p = QPainter(canvas)
+        x1, y1, x2, y2 = self._roi
+        rx = int(x1 * scale)
+        ry = int(y1 * scale)
+        rw = int((x2 - x1) * scale)
+        rh = int((y2 - y1) * scale)
+        p.setPen(QPen(QColor(255, 100, 0), 2, Qt.PenStyle.DashLine))
+        p.drawRect(rx, ry, rw, rh)
+        p.setPen(QPen(QColor(255, 100, 0)))
+        p.setFont(QFont("Consolas", 9))
+        p.drawText(rx + 4, ry - 4, f"{x1},{y1} -> {x2},{y2}")
+        p.end()
+        return canvas
+
+    def _to_image(self, pt: QPoint) -> tuple[int, int]:
+        scale = self._scale if self._scale > 0 else 1.0
+        ix = int(pt.x() / scale)
+        iy = int(pt.y() / scale)
+        return max(0, min(self._orig_w, ix)), max(0, min(self._orig_h, iy))
+
+    def eventFilter(self, obj, event):
+        if obj is self._inner:
+            t = event.type()
+            if t == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                if self._pixmap_src is not None:
+                    self._rb_origin = event.position().toPoint()
+                    if self._rubber_band is None:
+                        self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self._inner)
+                    self._rubber_band.setGeometry(QRect(self._rb_origin, QSize()))
+                    self._rubber_band.show()
+                return True
+            if t == QEvent.Type.MouseMove:
+                if self._rubber_band and self._rubber_band.isVisible():
+                    self._rubber_band.setGeometry(
+                        QRect(self._rb_origin, event.position().toPoint()).normalized()
+                    )
+                return False
+            if t == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                if self._rubber_band and self._rubber_band.isVisible():
+                    self._rubber_band.hide()
+                    rect = QRect(self._rb_origin, event.position().toPoint()).normalized()
+                    if rect.width() >= 8 and rect.height() >= 8:
+                        x1, y1 = self._to_image(rect.topLeft())
+                        x2, y2 = self._to_image(rect.bottomRight())
+                        if x2 > x1 and y2 > y1:
+                            self._roi = (x1, y1, x2, y2)
+                            self._redraw()
+                            self.roi_changed.emit(x1, y1, x2, y2)
+                return True
+        return super().eventFilter(obj, event)
+
+    def set_roi(self, roi: tuple[int, int, int, int] | None) -> None:
+        self._roi = roi
+        self._redraw()
+
+    def clear_roi(self) -> None:
+        self._roi = None
+        self._redraw()
+        self.roi_cleared.emit()
+
+    def request_roi(self) -> None:
+        self.setStyleSheet("background:#1a1a1a; border:2px solid #e06000;")
+
+    def acknowledge_roi(self) -> None:
+        self.setStyleSheet("background:#1a1a1a; border:1px solid #555;")
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        urls = event.mimeData().urls()
+        if urls:
+            self.file_dropped.emit(urls[0].toLocalFile())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Developed image preview — read-only, loads from a file path
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DevelopedPreview(_ZoomableImagePreview):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._reset_text()
+
+    def _reset_text(self) -> None:
+        self.setText("Developed image will appear here after analysis")
+
+    def set_from_file(self, path: str) -> None:
+        px = QPixmap(path)
+        if px.isNull():
+            self._pixmap_src = None
+            self.setText(f"Cannot load image:\n{path}")
+        else:
+            self._pixmap_src = px
+            self._orig_w = max(1, px.width())
+            self._orig_h = max(1, px.height())
+            self._inner.setText("")
+            self._redraw()
+
+    def clear(self) -> None:
+        self._pixmap_src = None
+        self._inner.setPixmap(QPixmap())
+        self._reset_text()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Denoise settings dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DenoiseSettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Denoise settings")
+        self.setMinimumWidth(320)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._method = QComboBox()
+        self._method.addItems(["wavelet", "bilateral"])
+        self._method.setCurrentText(cfg.get("method", "wavelet"))
+        form.addRow("Method:", self._method)
+
+        self._strength = QDoubleSpinBox()
+        self._strength.setRange(0.1, 50.0)
+        self._strength.setSingleStep(0.5)
+        self._strength.setDecimals(1)
+        self._strength.setValue(cfg.get("strength", 6.0))
+        form.addRow("Strength:", self._strength)
+
+        self._diameter = QSpinBox()
+        self._diameter.setRange(1, 30)
+        self._diameter.setValue(cfg.get("diameter", 5))
+        form.addRow("Diameter (bilateral):", self._diameter)
+
+        self._sigma_space = QDoubleSpinBox()
+        self._sigma_space.setRange(0.1, 20.0)
+        self._sigma_space.setSingleStep(0.1)
+        self._sigma_space.setDecimals(1)
+        self._sigma_space.setValue(cfg.get("sigma_space", 2.0))
+        form.addRow("Sigma space (bilateral):", self._sigma_space)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(buttons)
+
+    def get_settings(self) -> dict:
+        return {
+            "method": self._method.currentText(),
+            "strength": self._strength.value(),
+            "diameter": self._diameter.value(),
+            "sigma_space": self._sigma_space.value(),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sharpen settings dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SharpenSettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Sharpen settings")
+        self.setMinimumWidth(320)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._amount = QDoubleSpinBox()
+        self._amount.setRange(0.0, 5.0)
+        self._amount.setSingleStep(0.1)
+        self._amount.setDecimals(2)
+        self._amount.setValue(cfg.get("amount", 0.6))
+        form.addRow("Amount:", self._amount)
+
+        self._radius = QDoubleSpinBox()
+        self._radius.setRange(0.1, 5.0)
+        self._radius.setSingleStep(0.1)
+        self._radius.setDecimals(2)
+        self._radius.setValue(cfg.get("radius", 1.0))
+        form.addRow("Radius (px):", self._radius)
+
+        self._threshold = QDoubleSpinBox()
+        self._threshold.setRange(0.0, 10.0)
+        self._threshold.setSingleStep(0.1)
+        self._threshold.setDecimals(2)
+        self._threshold.setValue(cfg.get("threshold", 1.5))
+        form.addRow("Threshold (× σ):", self._threshold)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(buttons)
+
+    def get_settings(self) -> dict:
+        return {
+            "amount": self._amount.value(),
+            "radius": self._radius.value(),
+            "threshold": self._threshold.value(),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analyze tab
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AnalyzeTab(QWidget):
+    correction_ready = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._raw_path = ""
+        self._roi: tuple[int, int, int, int] | None = None
+        self._loader: RawPreviewLoader | None = None
+        self._proc: QProcess | None = None
+        self.denoise_args_provider: callable = lambda: ["--no-patch-variance-denoise"]
+        self.sharpen_args_provider: callable = lambda: ["--no-adaptive-sharpen"]
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        # ── file row (always visible, outside splitter) ───────────────────
+        file_row = QHBoxLayout()
+        self._raw_edit = QLineEdit()
+        self._raw_edit.setPlaceholderText("RAW file with color checker...")
+        self._raw_edit.textChanged.connect(self._on_path_changed)
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self._browse_raw)
+        file_row.addWidget(QLabel("RAW image:"))
+        file_row.addWidget(self._raw_edit, 1)
+        file_row.addWidget(browse)
+        root.addLayout(file_row)
+
+        # ── output folder row (always visible, outside splitter) ──────────
+        out_row = QHBoxLayout()
+        self._output_dir = QLineEdit(str(PROJECT_ROOT / "output"))
+        self._output_dir.setPlaceholderText("Output folder for all analysis results...")
+        browse_out = QPushButton("Browse...")
+        browse_out.clicked.connect(lambda: self._pick_dir(self._output_dir))
+        out_row.addWidget(QLabel("Output folder:"))
+        out_row.addWidget(self._output_dir, 1)
+        out_row.addWidget(browse_out)
+        root.addLayout(out_row)
+
+        # ── outer vertical splitter ───────────────────────────────────────
+        vsplit = QSplitter(Qt.Orientation.Vertical)
+        vsplit.setChildrenCollapsible(False)
+
+        # ── Panel 1: horizontal splitter — RAW preview | developed preview ─
+        hsplit = QSplitter(Qt.Orientation.Horizontal)
+        hsplit.setChildrenCollapsible(False)
+
+        # Left — RAW preview + ROI row
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(4)
+        self._preview = ImagePreview()
+        self._preview.roi_changed.connect(self._on_roi_changed)
+        self._preview.roi_cleared.connect(self._on_roi_cleared)
+        self._preview.file_dropped.connect(self._set_raw)
+        lv.addWidget(self._preview)
+        roi_row = QHBoxLayout()
+        roi_row.addWidget(QLabel("ROI (x1,y1,x2,y2):"))
+        self._roi_edit = QLineEdit()
+        self._roi_edit.setPlaceholderText("Draw on the preview above or type manually")
+        self._roi_edit.textEdited.connect(self._on_roi_text)
+        clear_roi = QPushButton("Clear ROI")
+        clear_roi.clicked.connect(self._preview.clear_roi)
+        roi_row.addWidget(self._roi_edit, 1)
+        roi_row.addWidget(clear_roi)
+        lv.addLayout(roi_row)
+        hsplit.addWidget(left)
+
+        # Right — "Show developed" checkbox + developed preview
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(4, 0, 0, 0)
+        rv.setSpacing(4)
+        self._show_developed = QCheckBox("Show developed image after analysis")
+        self._show_developed.setChecked(True)
+        rv.addWidget(self._show_developed)
+        self._developed = DevelopedPreview()
+        rv.addWidget(self._developed)
+        hsplit.addWidget(right)
+
+        # Synchronize zoom/scroll between RAW and developed previews
+        self._preview.zoom_changed.connect(self._developed.set_zoom_external)
+        self._preview.scroll_changed.connect(self._developed.set_scroll_external)
+        self._developed.zoom_changed.connect(self._preview.set_zoom_external)
+        self._developed.scroll_changed.connect(self._preview.set_scroll_external)
+
+        hsplit.setSizes([600, 400])
+        vsplit.addWidget(hsplit)
+
+        # ── Panel 2: parameters + run button ─────────────────────────────
+        panel2 = QWidget()
+        p2 = QVBoxLayout(panel2)
+        p2.setContentsMargins(0, 4, 0, 0)
+        p2.setSpacing(6)
+
+        # Format / colorspace / algorithm options
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Format:"))
+        self._fmt = QComboBox(); self._fmt.addItems(["jpeg", "tif", "png"])
+        opts.addWidget(self._fmt)
+        opts.addSpacing(12)
+        opts.addWidget(QLabel("Color space:"))
+        self._cs = QComboBox(); self._cs.addItems(["sRGB", "Display-P3"])
+        opts.addWidget(self._cs)
+        opts.addSpacing(20)
+        self._nonlinear = QCheckBox("Nonlinear corrections (HPPCC+RPCC)")
+        self._nonlinear.setChecked(True)   # mirrors PERFORM_NONLINEAR_CORRECTIONS default
+        opts.addWidget(self._nonlinear)
+        opts.addSpacing(12)
+        self._denoise = QCheckBox("Patch variance denoise")
+        self._denoise.setChecked(False)    # mirrors ENABLE_PATCH_VARIANCE_DENOISE default
+        opts.addWidget(self._denoise)
+        opts.addSpacing(12)
+        self._sharpen = QCheckBox("Adaptive sharpen")
+        self._sharpen.setChecked(False)    # mirrors ENABLE_ADAPTIVE_SHARPEN default
+        opts.addWidget(self._sharpen)
+        opts.addStretch()
+        p2.addLayout(opts)
+
+        self._run_btn = QPushButton("▶  Run analysis")
+        self._run_btn.setFixedHeight(34)
+        self._run_btn.setEnabled(False)
+        self._run_btn.clicked.connect(self._run)
+        p2.addWidget(self._run_btn)
+        p2.addStretch()
+        vsplit.addWidget(panel2)
+
+        # ── Panel 3: log ──────────────────────────────────────────────────
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFont(QFont("Consolas", 9))
+        vsplit.addWidget(self._log)
+
+        vsplit.setSizes([520, 160, 180])
+        root.addWidget(vsplit)
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    def _browse_raw(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select RAW file", "",
+            "RAW files (*.nef *.cr2 *.cr3 *.arw *.raf *.dng *.NEF *.CR2 *.CR3 *.ARW *.RAF *.DNG);;"
+            "All files (*)"
+        )
+        if path:
+            self._set_raw(path)
+
+    def _set_raw(self, path: str) -> None:
+        self._raw_edit.setText(path)
+
+    def _on_path_changed(self, text: str) -> None:
+        self._raw_path = text.strip()
+        self._run_btn.setEnabled(bool(self._raw_path))
+        p = Path(self._raw_path)
+        if p.is_file():
+            self._load_preview(str(p))
+
+    def _load_preview(self, path: str) -> None:
+        if self._loader and self._loader.isRunning():
+            self._loader.terminate()
+            self._loader.wait()
+        self._preview.setText("Loading preview...")
+        self._loader = RawPreviewLoader(path)
+        self._loader.ready.connect(self._preview.set_from_array)
+        self._loader.failed.connect(lambda e: self._preview.setText(f"Preview unavailable:\n{e}"))
+        self._loader.start()
+
+    def _on_roi_changed(self, x1, y1, x2, y2) -> None:
+        self._roi = (x1, y1, x2, y2)
+        self._roi_edit.setText(f"{x1},{y1},{x2},{y2}")
+        self._preview.acknowledge_roi()
+
+    def _on_roi_cleared(self) -> None:
+        self._roi = None
+        self._roi_edit.clear()
+
+    def _on_roi_text(self, text: str) -> None:
+        parts = text.replace(" ", "").split(",")
+        if len(parts) == 4:
+            try:
+                x1, y1, x2, y2 = (int(p) for p in parts)
+                if x2 > x1 and y2 > y1:
+                    self._roi = (x1, y1, x2, y2)
+                    self._preview.set_roi(self._roi)
+                    return
+            except ValueError:
+                pass
+        self._roi = None
+        self._preview.set_roi(None)
+
+    def _pick_dir(self, edit: QLineEdit) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Select folder", edit.text())
+        if d:
+            edit.setText(d)
+
+    # ── run ───────────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        if not self._raw_path:
+            return
+        self._log.clear()
+        self._developed.clear()
+        self._run_btn.setEnabled(False)
+
+        out = self._output_dir.text().strip() or str(PROJECT_ROOT / "output")
+        args = [
+            CC_SCRIPT, "analyze",
+            "--cc-image", self._raw_path,
+            "--analysis-dir", out,
+            "--process-dir", out,
+            "--output-format", self._fmt.currentText(),
+            "--output-colorspace", self._cs.currentText(),
+            "--no-show-detection-preview",
+            "--no-show-developed-image-preview",
+        ]
+        if self._nonlinear.isChecked():
+            args.append("--perform-nonlinear-corrections")
+        else:
+            args.append("--no-perform-nonlinear-corrections")
+        args += self.denoise_args_provider()
+        args += self.sharpen_args_provider()
+        if self._roi:
+            args += ["--roi", f"{self._roi[0]},{self._roi[1]},{self._roi[2]},{self._roi[3]}"]
+
+        self._proc = QProcess(self)
+        self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._proc.readyReadStandardOutput.connect(self._on_output)
+        self._proc.finished.connect(self._on_done)
+        self._proc.start(PYTHON, args)
+
+    def _on_output(self) -> None:
+        raw = self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        self._log.insertPlainText(raw)
+        self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+
+    def _on_done(self, code: int, _) -> None:
+        self._run_btn.setEnabled(True)
+        if code == 0:
+            corr_path = ""
+            for line in self._log.toPlainText().splitlines():
+                if "_correction.json" in line and "written" in line.lower():
+                    corr_path = line.split(":", 1)[-1].strip()
+                    self.correction_ready.emit(corr_path)
+                    break
+            self._log.append("\n✔ Analysis complete.")
+            if self._show_developed.isChecked():
+                img_path = None
+                for line in self._log.toPlainText().splitlines():
+                    if "Analysis image written to:" in line:
+                        img_path = Path(line.split(":", 1)[-1].strip())
+                        break
+                if img_path and img_path.exists():
+                    self._developed.set_from_file(str(img_path))
+                else:
+                    self._developed.setText("Developed image not found.")
+        else:
+            log_text = self._log.toPlainText()
+            if "No ColorChecker detected" in log_text:
+                self._log.append(
+                    "\n✖ Color checker not detected.\n"
+                    "   Draw a ROI on the preview to indicate where the color checker is, then retry."
+                )
+                self._preview.request_roi()
+                QMessageBox.information(
+                    self,
+                    "Color checker not detected",
+                    "The color checker could not be found automatically.\n\n"
+                    "Draw a rectangle on the RAW preview to indicate where the color checker is,\n"
+                    "then run the analysis again.",
+                )
+            else:
+                self._log.append(f"\n✖ Error (exit code {code}).")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Process tab
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProcessTab(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._proc: QProcess | None = None
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+
+        def path_row(placeholder: str, browse_slot) -> tuple[QLineEdit, QHBoxLayout]:
+            edit = QLineEdit(); edit.setPlaceholderText(placeholder)
+            btn = QPushButton("..."); btn.setFixedWidth(28); btn.clicked.connect(browse_slot)
+            row = QHBoxLayout(); row.addWidget(edit); row.addWidget(btn)
+            return edit, row
+
+        self._corr_edit, cr = path_row("*_correction.json file...", self._browse_corr)
+        form.addRow("Correction file:", cr)
+
+        self._src_edit, sr = path_row("Source RAW folder...", self._browse_src)
+        form.addRow("Source folder:", sr)
+
+        self._out_edit, or_ = path_row("Output folder for developed images...", self._browse_out)
+        form.addRow("Output folder:", or_)
+
+        root.addLayout(form)
+
+        opts = QHBoxLayout()
+        self._recursive = QCheckBox("Include subdirectories")
+        opts.addWidget(self._recursive)
+        opts.addStretch()
+        opts.addWidget(QLabel("Format:"))
+        self._fmt = QComboBox(); self._fmt.addItems(["jpeg", "tif", "png"])
+        opts.addWidget(self._fmt)
+        opts.addSpacing(12)
+        opts.addWidget(QLabel("Color space:"))
+        self._cs = QComboBox(); self._cs.addItems(["sRGB", "Display-P3"])
+        opts.addWidget(self._cs)
+        opts.addSpacing(12)
+        opts.addWidget(QLabel("Workers:"))
+        self._workers = QSpinBox(); self._workers.setRange(1, 32); self._workers.setValue(4)
+        opts.addWidget(self._workers)
+        root.addLayout(opts)
+
+        self._run_btn = QPushButton("▶  Run processing")
+        self._run_btn.setFixedHeight(34)
+        self._run_btn.clicked.connect(self._run)
+        root.addWidget(self._run_btn)
+
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFont(QFont("Consolas", 9))
+        root.addWidget(self._log)
+
+    def set_correction(self, path: str) -> None:
+        self._corr_edit.setText(path)
+
+    def _browse_corr(self) -> None:
+        p, _ = QFileDialog.getOpenFileName(self, "Correction file", "", "JSON (*.json);;All files (*)")
+        if p:
+            self._corr_edit.setText(p)
+
+    def _browse_src(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Source folder", self._src_edit.text())
+        if d:
+            self._src_edit.setText(d)
+
+    def _browse_out(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Output folder", self._out_edit.text())
+        if d:
+            self._out_edit.setText(d)
+
+    def _run(self) -> None:
+        corr = self._corr_edit.text().strip()
+        src = self._src_edit.text().strip()
+        if not corr or not src:
+            QMessageBox.warning(self, "Missing fields",
+                                "Please specify both the correction file and the source folder.")
+            return
+        self._log.clear()
+        self._run_btn.setEnabled(False)
+
+        args = [
+            CC_SCRIPT, "process",
+            corr, src,
+            "--output-format", self._fmt.currentText(),
+            "--output-colorspace", self._cs.currentText(),
+            "--workers", str(self._workers.value()),
+        ]
+        out = self._out_edit.text().strip()
+        if out:
+            args += ["--process-dir", out]
+        if self._recursive.isChecked():
+            args.append("--recursive")
+
+        self._proc = QProcess(self)
+        self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._proc.readyReadStandardOutput.connect(self._on_output)
+        self._proc.finished.connect(self._on_done)
+        self._proc.start(PYTHON, args)
+
+    def _on_output(self) -> None:
+        raw = self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        self._log.insertPlainText(raw)
+        self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+
+    def _on_done(self, code: int, _) -> None:
+        self._run_btn.setEnabled(True)
+        msg = "\n✔ Processing complete." if code == 0 else f"\n✖ Error (exit code {code})."
+        self._log.append(msg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main window
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("HPPCC — Color Correction Tool")
+        self.setMinimumSize(1000, 860)
+
+        self._denoise_cfg: dict = {
+            "method": "wavelet",
+            "strength": 6.0,
+            "diameter": 5,
+            "sigma_space": 2.0,
+        }
+        self._sharpen_cfg: dict = {
+            "amount": 0.6,
+            "radius": 1.0,
+            "threshold": 1.5,
+        }
+
+        self._tabs = QTabWidget()
+        self._analyze = AnalyzeTab()
+        self._process = ProcessTab()
+        self._tabs.addTab(self._analyze, "  Analysis  ")
+        self._tabs.addTab(self._process, "  Processing  ")
+
+        self._analyze.correction_ready.connect(self._on_correction_ready)
+
+        # Denoise/sharpen providers wired only into Analyze. During Process the
+        # values saved in the correction JSON take priority over GUI settings.
+        self._analyze.denoise_args_provider = self.get_denoise_args
+        self._analyze.sharpen_args_provider = self.get_sharpen_args
+
+        self._build_menu()
+        self.setCentralWidget(self._tabs)
+
+    # ── menu ─────────────────────────────────────────────────────────────
+
+    def _build_menu(self) -> None:
+        mb = self.menuBar()
+        denoise_menu = mb.addMenu("Denoise")
+
+        self._denoise_action = QAction("Denoise", self, checkable=True)
+        self._denoise_action.setChecked(self._analyze._denoise.isChecked())
+        self._denoise_action.toggled.connect(self._on_menu_denoise_toggled)
+        denoise_menu.addAction(self._denoise_action)
+
+        settings_action = QAction("Denoise settings...", self)
+        settings_action.triggered.connect(self._open_denoise_settings)
+        denoise_menu.addAction(settings_action)
+
+        # Keep menu action and checkbox in sync
+        self._analyze._denoise.toggled.connect(self._on_checkbox_denoise_toggled)
+
+        sharpen_menu = mb.addMenu("Sharpen")
+
+        self._sharpen_action = QAction("Sharpen", self, checkable=True)
+        self._sharpen_action.setChecked(self._analyze._sharpen.isChecked())
+        self._sharpen_action.toggled.connect(self._on_menu_sharpen_toggled)
+        sharpen_menu.addAction(self._sharpen_action)
+
+        sharpen_settings_action = QAction("Sharpen settings...", self)
+        sharpen_settings_action.triggered.connect(self._open_sharpen_settings)
+        sharpen_menu.addAction(sharpen_settings_action)
+
+        self._analyze._sharpen.toggled.connect(self._on_checkbox_sharpen_toggled)
+
+    def _on_menu_denoise_toggled(self, checked: bool) -> None:
+        self._analyze._denoise.blockSignals(True)
+        self._analyze._denoise.setChecked(checked)
+        self._analyze._denoise.blockSignals(False)
+
+    def _on_checkbox_denoise_toggled(self, checked: bool) -> None:
+        self._denoise_action.blockSignals(True)
+        self._denoise_action.setChecked(checked)
+        self._denoise_action.blockSignals(False)
+
+    def _open_denoise_settings(self) -> None:
+        dlg = DenoiseSettingsDialog(self._denoise_cfg, self)
+        if dlg.exec():
+            self._denoise_cfg = dlg.get_settings()
+
+    def _on_menu_sharpen_toggled(self, checked: bool) -> None:
+        self._analyze._sharpen.blockSignals(True)
+        self._analyze._sharpen.setChecked(checked)
+        self._analyze._sharpen.blockSignals(False)
+
+    def _on_checkbox_sharpen_toggled(self, checked: bool) -> None:
+        self._sharpen_action.blockSignals(True)
+        self._sharpen_action.setChecked(checked)
+        self._sharpen_action.blockSignals(False)
+
+    def _open_sharpen_settings(self) -> None:
+        dlg = SharpenSettingsDialog(self._sharpen_cfg, self)
+        if dlg.exec():
+            self._sharpen_cfg = dlg.get_settings()
+
+    def get_denoise_args(self) -> list[str]:
+        if not self._analyze._denoise.isChecked():
+            return ["--no-patch-variance-denoise"]
+        cfg = self._denoise_cfg
+        return [
+            "--patch-variance-denoise",
+            "--denoise-method", cfg["method"],
+            "--denoise-strength", str(cfg["strength"]),
+            "--denoise-diameter", str(cfg["diameter"]),
+            "--denoise-sigma-space", str(cfg["sigma_space"]),
+        ]
+
+    def get_sharpen_args(self) -> list[str]:
+        if not self._analyze._sharpen.isChecked():
+            return ["--no-adaptive-sharpen"]
+        cfg = self._sharpen_cfg
+        return [
+            "--adaptive-sharpen",
+            "--sharpen-amount", str(cfg["amount"]),
+            "--sharpen-radius", str(cfg["radius"]),
+            "--sharpen-threshold", str(cfg["threshold"]),
+        ]
+
+    # ── slots ─────────────────────────────────────────────────────────────
+
+    def _on_correction_ready(self, path: str) -> None:
+        self._process.set_correction(path)
+        self._tabs.setCurrentIndex(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point — GUI when run directly, CLI passthrough when args are given
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    if len(sys.argv) > 1:
+        from src.cc import main as cc_main
+        cc_main()
+        return
+
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    from PyQt6.QtGui import QPalette
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor(45, 45, 45))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(220, 220, 220))
+    pal.setColor(QPalette.ColorRole.Base, QColor(35, 35, 35))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
+    pal.setColor(QPalette.ColorRole.Text, QColor(220, 220, 220))
+    pal.setColor(QPalette.ColorRole.Button, QColor(60, 60, 60))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(220, 220, 220))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+    app.setPalette(pal)
+
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
