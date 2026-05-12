@@ -691,7 +691,7 @@ def _denoise_channel_wavelet(
     sigma: float,
     *,
     strength: float,
-    levels: int = 2,
+    levels: int = 4,
 ) -> np.ndarray:
     channel = np.asarray(channel, dtype=np.float64)
     approximation = channel
@@ -748,7 +748,7 @@ def denoise_linear_rgb(
             image[..., channel_index],
             float(sigma_rgb[channel_index]),
             strength=strength,
-            levels=2,
+            levels=4,
         )
     return denoised
 
