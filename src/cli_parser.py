@@ -13,6 +13,7 @@ from src.config import (
     DENOISE_STRENGTH,
     ENABLE_ADAPTIVE_SHARPEN,
     ENABLE_PATCH_VARIANCE_DENOISE,
+    ENABLE_PROCESS_WHITE_FIELD,
     HPPCC_BLEND_WIDTH,
     HPPCC_REGION_CANDIDATES,
     IMAGE_DIR,
@@ -161,6 +162,18 @@ def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defau
         type=float,
         default=SHARPEN_THRESHOLD if use_defaults else None,
         help="Multiplier of per-channel noise sigma below which detail is suppressed.",
+    )
+    parser.add_argument(
+        "--process-white-field",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_PROCESS_WHITE_FIELD if use_defaults else None,
+        help="Fit a vignetting/light fall-off model from a white reference image and apply it before HPPCC.",
+    )
+    parser.add_argument(
+        "--white-field-image",
+        type=Path,
+        default=None,
+        help="Path to the white reference RAW. Required when --process-white-field is set (analyze only).",
     )
     parser.add_argument(
         "--use-metadata-rgb-xyz-baseline",

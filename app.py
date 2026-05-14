@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -12,7 +14,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTextEdit,
     QFileDialog, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox,
     QRubberBand, QMessageBox, QGroupBox, QSizePolicy, QSplitter,
-    QDialog, QDialogButtonBox, QScrollArea,
+    QDialog, QDialogButtonBox, QScrollArea, QProgressBar,
 )
 from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal, QRect, QSize, QPoint, QEvent
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont, QAction
@@ -22,6 +24,169 @@ PYTHON = str(PROJECT_ROOT / ".venv" / "Scripts" / "python.exe")
 CC_SCRIPT = str(PROJECT_ROOT / "src" / "cc.py")
 
 _EXT_MAP = {"jpeg": ".jpg", "tif": ".tif", "png": ".png"}
+
+# Single source of truth for accepted input extensions. Importing from `src.raw`
+# would pull in numpy/rawpy at import time of app.py — keep it inline.
+_RAW_EXTS = {".nef", ".cr2", ".cr3", ".arw", ".raf", ".dng"}
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+_INPUT_EXTS = _RAW_EXTS | _IMAGE_EXTS
+
+_INPUT_FILE_FILTER = (
+    "Images (*.nef *.cr2 *.cr3 *.arw *.raf *.dng *.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp "
+    "*.NEF *.CR2 *.CR3 *.ARW *.RAF *.DNG *.JPG *.JPEG *.PNG *.TIF *.TIFF *.BMP *.WEBP);;"
+    "RAW (*.nef *.cr2 *.cr3 *.arw *.raf *.dng *.NEF *.CR2 *.CR3 *.ARW *.RAF *.DNG);;"
+    "All files (*)"
+)
+
+_APP_DIR_NAME = "coco"
+
+
+def _settings_dir() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / _APP_DIR_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / _APP_DIR_NAME
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / _APP_DIR_NAME
+
+
+def _settings_path() -> Path:
+    return _settings_dir() / "settings.json"
+
+
+def load_settings() -> dict:
+    path = _settings_path()
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    path = _settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        # Persistence is best-effort; never block app close on disk errors.
+        pass
+
+
+def _widget_value(widget):
+    from PyQt6.QtWidgets import QCheckBox, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox
+    if isinstance(widget, QCheckBox):
+        return widget.isChecked()
+    if isinstance(widget, QComboBox):
+        return widget.currentText()
+    if isinstance(widget, QLineEdit):
+        return widget.text()
+    if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+        return widget.value()
+    raise TypeError(f"Unsupported widget type for persistence: {type(widget).__name__}")
+
+
+def _set_widget_value(widget, value) -> None:
+    if value is None:
+        return
+    from PyQt6.QtWidgets import QCheckBox, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox
+    try:
+        if isinstance(widget, QCheckBox):
+            widget.setChecked(bool(value))
+        elif isinstance(widget, QComboBox):
+            widget.setCurrentText(str(value))
+        elif isinstance(widget, QLineEdit):
+            widget.setText(str(value))
+        elif isinstance(widget, QSpinBox):
+            widget.setValue(int(value))
+        elif isinstance(widget, QDoubleSpinBox):
+            widget.setValue(float(value))
+    except (TypeError, ValueError):
+        # Ignore malformed persisted values — keep default.
+        pass
+def _count_raw_files(folder: Path, recursive: bool) -> int:
+    if not folder.is_dir():
+        return 0
+    iterator = folder.rglob("*") if recursive else folder.iterdir()
+    return sum(1 for p in iterator if p.is_file() and p.suffix.lower() in _INPUT_EXTS)
+
+
+# Windows-only process-tree control via ctypes (no extra deps).
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.windll.kernel32
+    _ntdll = ctypes.windll.ntdll
+    _PROCESS_SUSPEND_RESUME = 0x0800
+    _PROCESS_TERMINATE = 0x0001
+    _TH32CS_SNAPPROCESS = 0x00000002
+
+    class _PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    def _enumerate_children(parent_pid: int) -> list[int]:
+        snapshot = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if snapshot in (None, 0) or snapshot == ctypes.c_void_p(-1).value:
+            return []
+        try:
+            entry = _PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32)
+            children: list[int] = []
+            if _kernel32.Process32First(snapshot, ctypes.byref(entry)):
+                while True:
+                    if int(entry.th32ParentProcessID) == parent_pid:
+                        children.append(int(entry.th32ProcessID))
+                    if not _kernel32.Process32Next(snapshot, ctypes.byref(entry)):
+                        break
+            return children
+        finally:
+            _kernel32.CloseHandle(snapshot)
+
+    def _enumerate_tree(root_pid: int) -> list[int]:
+        tree = [int(root_pid)]
+        idx = 0
+        while idx < len(tree):
+            tree.extend(_enumerate_children(tree[idx]))
+            idx += 1
+        return tree
+
+    def _process_op(pid: int, access: int, op) -> None:
+        h = _kernel32.OpenProcess(access, False, pid)
+        if h:
+            try:
+                op(h)
+            finally:
+                _kernel32.CloseHandle(h)
+
+    def suspend_process_tree(root_pid: int) -> None:
+        for pid in _enumerate_tree(root_pid):
+            _process_op(pid, _PROCESS_SUSPEND_RESUME, _ntdll.NtSuspendProcess)
+
+    def resume_process_tree(root_pid: int) -> None:
+        for pid in reversed(_enumerate_tree(root_pid)):
+            _process_op(pid, _PROCESS_SUSPEND_RESUME, _ntdll.NtResumeProcess)
+
+    def kill_process_tree(root_pid: int) -> None:
+        for pid in _enumerate_tree(root_pid):
+            _process_op(pid, _PROCESS_TERMINATE, lambda h: _kernel32.TerminateProcess(h, 1))
+else:
+    def suspend_process_tree(root_pid: int) -> None: return None
+    def resume_process_tree(root_pid: int) -> None: return None
+    def kill_process_tree(root_pid: int) -> None: return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -38,20 +203,28 @@ class RawPreviewLoader(QThread):
 
     def run(self) -> None:
         try:
-            import rawpy  # type: ignore
-            with rawpy.imread(self._path) as raw:
-                orig_h, orig_w = raw.raw_image_visible.shape[:2]
-                params = rawpy.Params(
-                    use_camera_wb=True,
-                    half_size=True,
-                    output_color=rawpy.ColorSpace.sRGB,
-                    output_bps=8,
-                    no_auto_bright=False,
-                    bright=1.0,
-                    gamma=(2.222, 4.5),
-                )
-                rgb = raw.postprocess(params=params)
-            self.ready.emit(rgb, orig_w, orig_h)
+            suffix = Path(self._path).suffix.lower()
+            if suffix in _RAW_EXTS:
+                import rawpy  # type: ignore
+                with rawpy.imread(self._path) as raw:
+                    orig_h, orig_w = raw.raw_image_visible.shape[:2]
+                    params = rawpy.Params(
+                        use_camera_wb=True,
+                        half_size=True,
+                        output_color=rawpy.ColorSpace.sRGB,
+                        output_bps=8,
+                        no_auto_bright=False,
+                        bright=1.0,
+                        gamma=(2.222, 4.5),
+                    )
+                    rgb = raw.postprocess(params=params)
+                self.ready.emit(rgb, orig_w, orig_h)
+                return
+            from PIL import Image  # local import: avoid PIL on RAW-only sessions
+            with Image.open(self._path) as img:
+                img_rgb = img.convert("RGB")
+                rgb = np.asarray(img_rgb, dtype=np.uint8)
+            self.ready.emit(rgb, rgb.shape[1], rgb.shape[0])
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -481,6 +654,40 @@ class SharpenSettingsDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HPPCC settings dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HPPCCSettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("HPPCC settings")
+        self.setMinimumWidth(320)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._blend_width = QDoubleSpinBox()
+        self._blend_width.setRange(0.01, 1.0)
+        self._blend_width.setSingleStep(0.05)
+        self._blend_width.setDecimals(2)
+        self._blend_width.setValue(cfg.get("blend_width", 0.15))
+        form.addRow("Blend width:", self._blend_width)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(buttons)
+
+    def get_settings(self) -> dict:
+        return {"blend_width": self._blend_width.value()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Analyze tab
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -495,6 +702,7 @@ class AnalyzeTab(QWidget):
         self._proc: QProcess | None = None
         self.denoise_args_provider: callable = lambda: ["--no-patch-variance-denoise"]
         self.sharpen_args_provider: callable = lambda: ["--no-adaptive-sharpen"]
+        self.hppcc_args_provider: callable = lambda: []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -505,7 +713,7 @@ class AnalyzeTab(QWidget):
         # ── file row (always visible, outside splitter) ───────────────────
         file_row = QHBoxLayout()
         self._raw_edit = QLineEdit()
-        self._raw_edit.setPlaceholderText("RAW file with color checker...")
+        self._raw_edit.setPlaceholderText("RAW or developed image with color checker...")
         self._raw_edit.textChanged.connect(self._on_path_changed)
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse_raw)
@@ -582,6 +790,23 @@ class AnalyzeTab(QWidget):
         p2.setContentsMargins(0, 4, 0, 0)
         p2.setSpacing(6)
 
+        # White field reference (vignetting correction) — must precede the
+        # format/colorspace row so the path field stays visible on resize.
+        white_row = QHBoxLayout()
+        self._white_field = QCheckBox("Process white field")
+        self._white_field.setChecked(False)
+        self._white_field.toggled.connect(self._on_white_field_toggled)
+        white_row.addWidget(self._white_field)
+        self._white_field_path = QLineEdit()
+        self._white_field_path.setPlaceholderText("Path to white reference RAW (required if checked)...")
+        self._white_field_path.setEnabled(False)
+        white_row.addWidget(self._white_field_path, 1)
+        self._white_field_browse = QPushButton("Browse...")
+        self._white_field_browse.setEnabled(False)
+        self._white_field_browse.clicked.connect(self._browse_white_field)
+        white_row.addWidget(self._white_field_browse)
+        p2.addLayout(white_row)
+
         # Format / colorspace / algorithm options
         opts = QHBoxLayout()
         opts.addWidget(QLabel("Format:"))
@@ -606,11 +831,18 @@ class AnalyzeTab(QWidget):
         opts.addStretch()
         p2.addLayout(opts)
 
+        run_row = QHBoxLayout()
+        run_row.setSpacing(8)
+        self._led = QLabel()
+        self._led.setFixedSize(14, 14)
+        self._set_led_idle()
+        run_row.addWidget(self._led)
         self._run_btn = QPushButton("▶  Run analysis")
         self._run_btn.setFixedHeight(34)
         self._run_btn.setEnabled(False)
         self._run_btn.clicked.connect(self._run)
-        p2.addWidget(self._run_btn)
+        run_row.addWidget(self._run_btn, 1)
+        p2.addLayout(run_row)
         p2.addStretch()
         vsplit.addWidget(panel2)
 
@@ -627,11 +859,11 @@ class AnalyzeTab(QWidget):
 
     def _browse_raw(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select RAW file", "",
-            "RAW files (*.nef *.cr2 *.cr3 *.arw *.raf *.dng *.NEF *.CR2 *.CR3 *.ARW *.RAF *.DNG);;"
-            "All files (*)"
+            self, "Select input image", "", _INPUT_FILE_FILTER,
         )
         if path:
+            if not self._output_dir.text().strip():
+                self._output_dir.setText(str(Path(path).parent / "out"))
             self._set_raw(path)
 
     def _set_raw(self, path: str) -> None:
@@ -682,14 +914,45 @@ class AnalyzeTab(QWidget):
         if d:
             edit.setText(d)
 
+    def _on_white_field_toggled(self, checked: bool) -> None:
+        self._white_field_path.setEnabled(checked)
+        self._white_field_browse.setEnabled(checked)
+
+    def _set_led_idle(self) -> None:
+        self._led.setStyleSheet(
+            "background-color: #2ecc71; border: 1px solid #1e8449; border-radius: 7px;"
+        )
+        self._led.setToolTip("Idle")
+
+    def _set_led_busy(self) -> None:
+        self._led.setStyleSheet(
+            "background-color: #e74c3c; border: 1px solid #922b21; border-radius: 7px;"
+        )
+        self._led.setToolTip("Analyzing")
+
+    def _browse_white_field(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select white reference image", "", _INPUT_FILE_FILTER,
+        )
+        if path:
+            self._white_field_path.setText(path)
+
     # ── run ───────────────────────────────────────────────────────────────
 
     def _run(self) -> None:
         if not self._raw_path:
             return
+        if self._white_field.isChecked() and not self._white_field_path.text().strip():
+            QMessageBox.warning(
+                self, "Missing white field",
+                "'Process white field' is enabled but no reference RAW was provided.\n"
+                "Pick a white reference image or uncheck the option.",
+            )
+            return
         self._log.clear()
         self._developed.clear()
         self._run_btn.setEnabled(False)
+        self._set_led_busy()
 
         out = self._output_dir.text().strip() or str(PROJECT_ROOT / "output")
         args = [
@@ -708,6 +971,14 @@ class AnalyzeTab(QWidget):
             args.append("--no-perform-nonlinear-corrections")
         args += self.denoise_args_provider()
         args += self.sharpen_args_provider()
+        args += self.hppcc_args_provider()
+        if self._white_field.isChecked():
+            args += [
+                "--process-white-field",
+                "--white-field-image", self._white_field_path.text().strip(),
+            ]
+        else:
+            args.append("--no-process-white-field")
         if self._roi:
             args += ["--roi", f"{self._roi[0]},{self._roi[1]},{self._roi[2]},{self._roi[3]}"]
 
@@ -724,6 +995,7 @@ class AnalyzeTab(QWidget):
 
     def _on_done(self, code: int, _) -> None:
         self._run_btn.setEnabled(True)
+        self._set_led_idle()
         if code == 0:
             corr_path = ""
             for line in self._log.toPlainText().splitlines():
@@ -769,6 +1041,10 @@ class ProcessTab(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._proc: QProcess | None = None
+        self._processed_count = 0
+        self._total_count = 0
+        self._output_buffer = ""
+        self._paused = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -813,15 +1089,64 @@ class ProcessTab(QWidget):
         opts.addWidget(self._workers)
         root.addLayout(opts)
 
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(6)
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 1)
+        self._progress.setValue(0)
+        self._progress.setFormat("%v / %m files (%p%)")
+        self._progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._progress.setFixedHeight(20)
+        self._progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        progress_row.addWidget(self._progress, 4)
+        progress_row.addStretch(4)
+        root.addLayout(progress_row)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
+        self._led = QLabel()
+        self._led.setFixedSize(14, 14)
+        self._set_led_idle()
+        action_row.addWidget(self._led)
         self._run_btn = QPushButton("▶  Run processing")
         self._run_btn.setFixedHeight(34)
+        self._run_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._run_btn.clicked.connect(self._run)
-        root.addWidget(self._run_btn)
+        action_row.addWidget(self._run_btn, 4)
+        self._stop_btn = QPushButton("■  Stop")
+        self._stop_btn.setFixedHeight(34)
+        self._stop_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self._on_stop)
+        action_row.addWidget(self._stop_btn, 2)
+        self._pause_btn = QPushButton("⏸  Pause")
+        self._pause_btn.setFixedHeight(34)
+        self._pause_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.clicked.connect(self._on_pause_toggle)
+        if sys.platform != "win32":
+            self._pause_btn.setToolTip("Pause/Resume is supported only on Windows in this build.")
+        action_row.addWidget(self._pause_btn, 2)
+        root.addLayout(action_row)
 
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setFont(QFont("Consolas", 9))
         root.addWidget(self._log)
+
+    # ── LED helpers ────────────────────────────────────────────────────────
+
+    def _set_led_idle(self) -> None:
+        self._led.setStyleSheet(
+            "background-color: #2ecc71; border: 1px solid #1e8449; border-radius: 7px;"
+        )
+        self._led.setToolTip("Idle")
+
+    def _set_led_busy(self) -> None:
+        self._led.setStyleSheet(
+            "background-color: #e74c3c; border: 1px solid #922b21; border-radius: 7px;"
+        )
+        self._led.setToolTip("Processing")
 
     def set_correction(self, path: str) -> None:
         self._corr_edit.setText(path)
@@ -848,8 +1173,30 @@ class ProcessTab(QWidget):
             QMessageBox.warning(self, "Missing fields",
                                 "Please specify both the correction file and the source folder.")
             return
+
+        src_path = Path(src)
+        recursive = self._recursive.isChecked()
+        total = _count_raw_files(src_path, recursive)
+        if total == 0:
+            QMessageBox.warning(
+                self, "No RAW files",
+                f"No RAW files found in:\n{src}\n\n"
+                "Check the source folder and the 'Include subdirectories' option.",
+            )
+            return
+
         self._log.clear()
+        self._processed_count = 0
+        self._total_count = total
+        self._output_buffer = ""
+        self._paused = False
+        self._progress.setRange(0, total)
+        self._progress.setValue(0)
+        self._set_led_busy()
         self._run_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+        self._pause_btn.setEnabled(sys.platform == "win32")
+        self._pause_btn.setText("⏸  Pause")
 
         args = [
             CC_SCRIPT, "process",
@@ -861,7 +1208,7 @@ class ProcessTab(QWidget):
         out = self._out_edit.text().strip()
         if out:
             args += ["--process-dir", out]
-        if self._recursive.isChecked():
+        if recursive:
             args.append("--recursive")
 
         self._proc = QProcess(self)
@@ -870,13 +1217,55 @@ class ProcessTab(QWidget):
         self._proc.finished.connect(self._on_done)
         self._proc.start(PYTHON, args)
 
+    def _on_stop(self) -> None:
+        if self._proc is None or self._proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        pid = int(self._proc.processId())
+        if self._paused and sys.platform == "win32":
+            # A suspended process can't be killed cleanly — wake it up first.
+            resume_process_tree(pid)
+            self._paused = False
+        if sys.platform == "win32":
+            kill_process_tree(pid)
+        else:
+            self._proc.kill()
+        self._log.append("\n■ Processing stopped by user.")
+
+    def _on_pause_toggle(self) -> None:
+        if self._proc is None or self._proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        if sys.platform != "win32":
+            return
+        pid = int(self._proc.processId())
+        if self._paused:
+            resume_process_tree(pid)
+            self._paused = False
+            self._pause_btn.setText("⏸  Pause")
+            self._log.append("\n▶ Resumed.")
+        else:
+            suspend_process_tree(pid)
+            self._paused = True
+            self._pause_btn.setText("▶  Resume")
+            self._log.append("\n⏸ Paused.")
+
     def _on_output(self) -> None:
         raw = self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
         self._log.insertPlainText(raw)
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+        self._output_buffer += raw
+        while "\n" in self._output_buffer:
+            line, self._output_buffer = self._output_buffer.split("\n", 1)
+            if line.startswith("Processed:"):
+                self._processed_count += 1
+                self._progress.setValue(min(self._processed_count, self._total_count))
 
     def _on_done(self, code: int, _) -> None:
         self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.setText("⏸  Pause")
+        self._paused = False
+        self._set_led_idle()
         msg = "\n✔ Processing complete." if code == 0 else f"\n✖ Error (exit code {code})."
         self._log.append(msg)
 
@@ -902,6 +1291,10 @@ class MainWindow(QMainWindow):
             "radius": 1.0,
             "threshold": 1.5,
         }
+        self._hppcc_cfg: dict = {
+            "use_blending": True,
+            "blend_width": 0.15,
+        }
 
         self._tabs = QTabWidget()
         self._analyze = AnalyzeTab()
@@ -911,18 +1304,96 @@ class MainWindow(QMainWindow):
 
         self._analyze.correction_ready.connect(self._on_correction_ready)
 
-        # Denoise/sharpen providers wired only into Analyze. During Process the
-        # values saved in the correction JSON take priority over GUI settings.
+        # Denoise/sharpen/HPPCC providers wired only into Analyze. During
+        # Process the values saved in the correction JSON take priority over
+        # GUI settings.
         self._analyze.denoise_args_provider = self.get_denoise_args
         self._analyze.sharpen_args_provider = self.get_sharpen_args
+        self._analyze.hppcc_args_provider = self.get_hppcc_args
 
         self._build_menu()
         self.setCentralWidget(self._tabs)
+
+        # Restore saved UI state (after menu is built so checkbox-driven menu
+        # sync signals fire correctly during restore).
+        self._restore_state(load_settings())
+
+    # ── persistence ──────────────────────────────────────────────────────
+
+    def _persisted_widgets(self) -> dict:
+        # Single registry — add a line here for every new persistable control.
+        # Keys are namespaced "<tab>.<name>" so the JSON stays human-readable.
+        a = self._analyze
+        p = self._process
+        return {
+            "analyze.raw_path":       a._raw_edit,
+            "analyze.output_dir":     a._output_dir,
+            "analyze.roi":            a._roi_edit,
+            "analyze.show_developed": a._show_developed,
+            "analyze.format":         a._fmt,
+            "analyze.colorspace":     a._cs,
+            "analyze.nonlinear":      a._nonlinear,
+            "analyze.denoise":        a._denoise,
+            "analyze.sharpen":        a._sharpen,
+            "analyze.white_field":    a._white_field,
+            "analyze.white_field_path": a._white_field_path,
+            "process.correction":     p._corr_edit,
+            "process.source":         p._src_edit,
+            "process.output":         p._out_edit,
+            "process.recursive":      p._recursive,
+            "process.format":         p._fmt,
+            "process.colorspace":     p._cs,
+            "process.workers":        p._workers,
+        }
+
+    def _persisted_state(self) -> dict:
+        widgets = self._persisted_widgets()
+        out = {key: _widget_value(w) for key, w in widgets.items()}
+        out["denoise_cfg"] = dict(self._denoise_cfg)
+        out["sharpen_cfg"] = dict(self._sharpen_cfg)
+        out["hppcc_cfg"] = dict(self._hppcc_cfg)
+        return out
+
+    def _restore_state(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+        for key, widget in self._persisted_widgets().items():
+            if key in data:
+                _set_widget_value(widget, data[key])
+        denoise = data.get("denoise_cfg")
+        if isinstance(denoise, dict):
+            self._denoise_cfg.update(denoise)
+        sharpen = data.get("sharpen_cfg")
+        if isinstance(sharpen, dict):
+            self._sharpen_cfg.update(sharpen)
+        hppcc = data.get("hppcc_cfg")
+        if isinstance(hppcc, dict):
+            self._hppcc_cfg.update(hppcc)
+            # Sync the menu action with the restored toggle state.
+            if hasattr(self, "_hppcc_action"):
+                self._hppcc_action.blockSignals(True)
+                self._hppcc_action.setChecked(bool(self._hppcc_cfg.get("use_blending", True)))
+                self._hppcc_action.blockSignals(False)
+
+    def closeEvent(self, event) -> None:
+        save_settings(self._persisted_state())
+        super().closeEvent(event)
 
     # ── menu ─────────────────────────────────────────────────────────────
 
     def _build_menu(self) -> None:
         mb = self.menuBar()
+        hppcc_menu = mb.addMenu("HPPCC")
+
+        self._hppcc_action = QAction("HPPCC blending", self, checkable=True)
+        self._hppcc_action.setChecked(self._hppcc_cfg["use_blending"])
+        self._hppcc_action.toggled.connect(self._on_hppcc_toggled)
+        hppcc_menu.addAction(self._hppcc_action)
+
+        hppcc_settings_action = QAction("HPPCC settings...", self)
+        hppcc_settings_action.triggered.connect(self._open_hppcc_settings)
+        hppcc_menu.addAction(hppcc_settings_action)
+
         denoise_menu = mb.addMenu("Denoise")
 
         self._denoise_action = QAction("Denoise", self, checkable=True)
@@ -980,6 +1451,14 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self._sharpen_cfg = dlg.get_settings()
 
+    def _on_hppcc_toggled(self, checked: bool) -> None:
+        self._hppcc_cfg["use_blending"] = bool(checked)
+
+    def _open_hppcc_settings(self) -> None:
+        dlg = HPPCCSettingsDialog(self._hppcc_cfg, self)
+        if dlg.exec():
+            self._hppcc_cfg.update(dlg.get_settings())
+
     def get_denoise_args(self) -> list[str]:
         if not self._analyze._denoise.isChecked():
             return ["--no-patch-variance-denoise"]
@@ -1003,11 +1482,21 @@ class MainWindow(QMainWindow):
             "--sharpen-threshold", str(cfg["threshold"]),
         ]
 
+    def get_hppcc_args(self) -> list[str]:
+        cfg = self._hppcc_cfg
+        if cfg.get("use_blending", True):
+            return [
+                "--use-hppcc-blending",
+                "--hppcc-blend-width", str(cfg.get("blend_width", 0.15)),
+            ]
+        return ["--no-use-hppcc-blending"]
+
     # ── slots ─────────────────────────────────────────────────────────────
 
     def _on_correction_ready(self, path: str) -> None:
+        # Pre-fill the correction path on the Process tab so the user can jump
+        # there manually, but stay on Analysis — auto-switching is disruptive.
         self._process.set_correction(path)
-        self._tabs.setCurrentIndex(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

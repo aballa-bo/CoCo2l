@@ -10,6 +10,11 @@ import numpy as np
 import rawpy
 
 
+RAW_SUFFIXES = frozenset({".nef", ".cr2", ".cr3", ".arw", ".raf", ".dng"})
+IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"})
+INPUT_SUFFIXES = RAW_SUFFIXES | IMAGE_SUFFIXES
+
+
 @dataclass(frozen=True)
 class RawLinearImage:
     """Linear demosaiced camera RGB and relevant capture metadata."""
@@ -111,6 +116,9 @@ def load_raw_linear_rgb(
             no_auto_scale=True,
             gamma=(1.0, 1.0),
             chromatic_aberration=(1.0, 1.0),
+            # Highlight recovery: blend unclipped channels into clipped ones so
+            # specular reflections come out neutral instead of magenta-cast.
+            highlight_mode=rawpy.HighlightMode.Blend,
         )
         rgb = raw.postprocess(params=params).astype(np.float64)
         color_desc = raw.color_desc.decode("ascii", errors="ignore")
@@ -144,3 +152,55 @@ def load_raw_linear_rgb(
             color_desc=color_desc,
             raw_pattern=raw_pattern,
         )
+
+
+def _srgb_eotf_to_linear(rgb: np.ndarray) -> np.ndarray:
+    """Inverse sRGB transfer function (gamma decode). Works in [0, 1] domain."""
+    rgb = np.asarray(rgb, dtype=np.float64)
+    return np.where(
+        rgb <= 0.04045,
+        rgb / 12.92,
+        ((rgb + 0.055) / 1.055) ** 2.4,
+    )
+
+
+def _load_pil_linear_rgb(path: Path) -> RawLinearImage:
+    """Read a non-RAW image (JPEG/PNG/TIFF/...) and linearize from its color
+    space. We assume an sRGB-style EOTF (also correct for Display-P3 and
+    Rec.709; close enough for Adobe RGB). Metadata fields that have no
+    meaningful equivalent for a developed image (sensor levels, camera WB,
+    rgb_xyz_matrix) are returned as placeholders/None so downstream gating
+    in cc.py naturally skips the metadata-dependent branches.
+    """
+    from PIL import Image  # local import: keeps cold-start cheap for RAW path
+
+    with Image.open(path) as img:
+        img_rgb = img.convert("RGB")
+        rgb_u8 = np.asarray(img_rgb, dtype=np.uint8)
+
+    rgb_norm = rgb_u8.astype(np.float64) / 255.0
+    rgb_linear = _srgb_eotf_to_linear(rgb_norm)
+
+    return RawLinearImage(
+        rgb=rgb_linear,
+        black_level_per_channel=(0, 0, 0),
+        camera_white_level_per_channel=(1, 1, 1),
+        camera_whitebalance=None,
+        daylight_whitebalance=None,
+        white_level=None,
+        rgb_xyz_matrix=None,
+        color_desc="RGB",
+        raw_pattern=None,
+    )
+
+
+def load_image_linear_rgb(path: str | Path, **raw_kwargs) -> RawLinearImage:
+    """Dispatch to the RAW or non-RAW loader based on file extension.
+
+    For RAW files, forwards `raw_kwargs` to `load_raw_linear_rgb`. For
+    developed images, the kwargs are ignored.
+    """
+    p = Path(path)
+    if p.suffix.lower() in RAW_SUFFIXES:
+        return load_raw_linear_rgb(p, **raw_kwargs)
+    return _load_pil_linear_rgb(p)

@@ -364,18 +364,15 @@ def find_raw_path(image_dir: Path) -> Path:
 
 
 def find_raw_paths(image_dir: Path, *, recursive: bool = False) -> list[Path]:
-    glob = "**/{}" if recursive else "{}"
-    candidates = []
-    for pattern in ("*.NEF", "*.CR2", "*.CR3", "*.ARW", "*.RAF", "*.DNG",
-                    "*.nef", "*.cr2", "*.cr3", "*.arw", "*.raf", "*.dng"):
-        candidates.extend(image_dir.glob(glob.format(pattern)))
+    from .raw import INPUT_SUFFIXES
+    iterator = image_dir.rglob("*") if recursive else image_dir.iterdir()
     seen: set[Path] = set()
     result = []
-    for p in sorted(candidates):
-        if p not in seen:
+    for p in iterator:
+        if p.is_file() and p.suffix.lower() in INPUT_SUFFIXES and p not in seen:
             seen.add(p)
             result.append(p)
-    return result
+    return sorted(result)
 
 
 def _load_reference_triplets(path: Path, key: str) -> np.ndarray:
@@ -546,7 +543,110 @@ def normalize_with_sensor_levels(
     if np.any(span <= 0):
         raise ValueError("Sensor white levels must exceed black levels for all RGB channels.")
     normalized = (rgb - black_levels_rgb) / span
-    return np.clip(normalized, 0.0, None)
+    return np.clip(normalized, 0.0, 1.0)
+
+
+def compute_white_field_falloff(white_rgb: np.ndarray) -> dict | None:
+    # Fit a radial polynomial `atten(r²) = c0 + c1·r² + c2·r⁴` to the
+    # light fall-off of a uniformly-white reference image. r is the pixel
+    # distance from the image center, normalized so the corner is r = 1.
+    # The polynomial is scale-invariant: the caller reconstructs the per-
+    # pixel gain map from any image's dimensions at apply time.
+    white_rgb = np.asarray(white_rgb, dtype=np.float64)
+    if white_rgb.ndim != 3 or white_rgb.shape[2] < 3 or min(white_rgb.shape[:2]) < 32:
+        return None
+
+    h, w = white_rgb.shape[:2]
+    cy, cx = h / 2.0, w / 2.0
+    diag2 = cx * cx + cy * cy
+
+    brightness = np.mean(white_rgb[..., :3], axis=-1)
+    brightness = cv2.GaussianBlur(brightness.astype(np.float32), (0, 0), sigmaX=15.0).astype(np.float64)
+
+    yy, xx = np.indices((h, w))
+    r2_px = (xx - cx) ** 2 + (yy - cy) ** 2
+    r2_norm = r2_px / max(diag2, 1.0)
+
+    center_radius_px = 0.05 * min(h, w)
+    center_mask = r2_px < center_radius_px * center_radius_px
+    if not center_mask.any():
+        return None
+    center_value = float(np.percentile(brightness[center_mask], 98))
+    if center_value <= 1e-6:
+        return None
+
+    attenuation = brightness / center_value
+
+    flat_r2 = r2_norm.flatten()
+    flat_att = attenuation.flatten()
+    if flat_r2.size > 200_000:
+        step = flat_r2.size // 200_000
+        flat_r2 = flat_r2[::step]
+        flat_att = flat_att[::step]
+
+    coeffs = np.polyfit(flat_r2, flat_att, 2)   # [c2 (r⁴), c1 (r²), c0]
+    c2, c1, c0 = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]))
+    corner_attenuation = c0 + c1 + c2
+
+    return {
+        "polynomial_in_r2": [c2, c1, c0],
+        "center_brightness": center_value,
+        "min_attenuation": float(np.min(attenuation)),
+        "corner_attenuation": float(corner_attenuation),
+    }
+
+
+def _white_field_poly(params: dict, r2: np.ndarray) -> np.ndarray:
+    c2, c1, c0 = (float(v) for v in params["polynomial_in_r2"])
+    return c0 + c1 * r2 + c2 * r2 * r2
+
+
+def apply_white_field_correction(rgb: np.ndarray, params: dict) -> np.ndarray:
+    if not params:
+        return rgb
+    rgb = np.asarray(rgb, dtype=np.float64)
+    h, w = rgb.shape[:2]
+    cy, cx = h / 2.0, w / 2.0
+    diag2 = max(cx * cx + cy * cy, 1.0)
+    yy, xx = np.indices((h, w))
+    r2 = ((xx - cx) ** 2 + (yy - cy) ** 2) / diag2
+    atten = np.clip(_white_field_poly(params, r2), 0.05, None)
+    gain = 1.0 / atten
+    return rgb * gain[..., None]
+
+
+def apply_white_field_correction_to_patches(
+    rgb_patches: np.ndarray,
+    patch_centers: np.ndarray,
+    image_shape: tuple,
+    params: dict,
+) -> np.ndarray:
+    if not params:
+        return rgb_patches
+    rgb_patches = np.asarray(rgb_patches, dtype=np.float64)
+    h, w = image_shape[:2]
+    cy, cx = h / 2.0, w / 2.0
+    diag2 = max(cx * cx + cy * cy, 1.0)
+    centers = np.asarray(patch_centers, dtype=np.float64)
+    r2 = ((centers[:, 0] - cx) ** 2 + (centers[:, 1] - cy) ** 2) / diag2
+    atten = np.clip(_white_field_poly(params, r2), 0.05, None)
+    gain = 1.0 / atten
+    return rgb_patches * gain[:, None]
+
+
+def desaturate_highlights(rgb: np.ndarray, *, threshold: float = 0.93) -> np.ndarray:
+    # Above `threshold` we leave HPPCC's training range; the per-hue regions
+    # extrapolate unreliably and demosaicing artefacts (false-color near
+    # clipped pixels) push the hue toward magenta/green. Forcing channels
+    # toward their per-pixel max smoothly removes those colored blobs from
+    # specular highlights — at the cost of progressively flattening any
+    # legitimate saturation above the threshold (sensor info there is
+    # already partly lost to clipping anyway).
+    rgb = np.asarray(rgb, dtype=np.float64)
+    max_channel = np.max(rgb, axis=-1, keepdims=True)
+    denom = max(1.0 - float(threshold), 1e-12)
+    blend = np.clip((max_channel - float(threshold)) / denom, 0.0, 1.0)
+    return rgb * (1.0 - blend) + max_channel * blend
 
 
 def _extract_patch_pixels(
@@ -948,6 +1048,9 @@ def load_analysis_result(path: Path) -> dict[str, object]:
 def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
     command = [
         "exiftool",
+        "-m",                              # ignore minor warnings (otherwise exit code 1)
+        "-charset", "filename=UTF8",       # interpret path args as UTF-8 (non-ASCII paths)
+        "-charset", "utf8",                # tag values also UTF-8
         "-overwrite_original",
         "-TagsFromFile",
         str(source_raw_path),
@@ -957,16 +1060,12 @@ def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
         "-MakerNotes:all",
         str(target_image_path),
     ]
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = subprocess.run(command, check=False, capture_output=True)
     if completed.returncode != 0:
-        raise RuntimeError(
-            f"exiftool failed for {target_image_path}: {completed.stderr.strip() or completed.stdout.strip()}"
-        )
+        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+        stdout = completed.stdout.decode("utf-8", errors="replace").strip()
+        detail = stderr or stdout or f"exit code {completed.returncode}, no output"
+        raise RuntimeError(f"exiftool failed for {target_image_path}: {detail}")
 
 
 def to_uint8_image(rgb: np.ndarray) -> np.ndarray:

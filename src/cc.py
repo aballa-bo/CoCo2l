@@ -1,7 +1,14 @@
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace as _dc_replace
 import sys
+import warnings
 from pathlib import Path
+
+# Silence colour-science's matplotlib-not-installed notice; we don't use its plotting APIs.
+warnings.filterwarnings(
+    "ignore",
+    message=r'.*"Matplotlib" related API features are not available.*',
+)
 
 import numpy as np
 
@@ -68,10 +75,14 @@ from src.report import (
 )
 from src.utils import (
     apply_matrix_transform,
+    apply_white_field_correction,
+    apply_white_field_correction_to_patches,
     analyze_neutral_illuminant_gradient,
     bradford_adapt_xyz,
+    compute_white_field_falloff,
     copy_exif_from_raw,
     denoise_linear_rgb,
+    desaturate_highlights,
     delta_e00_summary,
     estimate_scene_white_from_camera_wb,
     estimate_scene_white_from_neutral_patches,
@@ -160,7 +171,7 @@ def run_analysis(args) -> None:
         reference_xyz = load_reference_xyz(args.reference_path)
     reference_chroma = load_reference_chroma(args.reference_path)
 
-    raw = src.load_raw_linear_rgb(raw_path)
+    raw = src.load_image_linear_rgb(raw_path)
     undistorted_rgb, undistort_info = try_undistort(raw.rgb, raw_path)
     if undistort_info is not None:
         raw = _dc_replace(raw, rgb=undistorted_rgb)
@@ -181,6 +192,38 @@ def run_analysis(args) -> None:
         sensor_black_levels_rgb,
         sensor_white_levels_rgb,
     )
+
+    white_field_params = None
+    if getattr(args, "process_white_field", False):
+        white_field_image = getattr(args, "white_field_image", None)
+        if white_field_image is None:
+            raise ValueError("--process-white-field requires --white-field-image to be set.")
+        white_field_path = Path(white_field_image)
+        if not white_field_path.is_file():
+            raise FileNotFoundError(f"White field image not found: {white_field_path}")
+        print(f"Loading white field reference: {white_field_path}")
+        white_raw = src.load_image_linear_rgb(white_field_path)
+        white_black = reduce_cfa_values_to_rgb(white_raw.black_level_per_channel, white_raw.color_desc)
+        white_white = reduce_cfa_values_to_rgb(white_raw.camera_white_level_per_channel, white_raw.color_desc)
+        if white_black is None or white_white is None:
+            raise RuntimeError("White field RAW is missing sensor black/white metadata.")
+        white_normalized = normalize_with_sensor_levels(white_raw.rgb, white_black, white_white)
+        white_field_params = compute_white_field_falloff(white_normalized)
+        if white_field_params is None:
+            print("Warning: white field analysis failed; correction will be skipped.")
+        else:
+            white_field_params["image_path"] = str(white_field_path)
+            print(
+                f"White field fitted: corner attenuation = {white_field_params['corner_attenuation']:.3f}, "
+                f"min attenuation = {white_field_params['min_attenuation']:.3f}"
+            )
+            normalized_rgb = apply_white_field_correction_to_patches(
+                normalized_rgb,
+                detection.absolute_patch_centers,
+                raw.rgb.shape,
+                white_field_params,
+            )
+
     corrected_rgb = normalized_rgb
 
     reliable_patch_indices, excluded_patch_indices = identify_unreliable_patches(
@@ -201,6 +244,8 @@ def run_analysis(args) -> None:
         sensor_black_levels_rgb,
         sensor_white_levels_rgb,
     )
+    if white_field_params is not None:
+        scene_linear_rgb = apply_white_field_correction(scene_linear_rgb, white_field_params)
     if args.patch_variance_denoise or args.adaptive_sharpen:
         noise_profile = estimate_noise_profile_from_patches(
             scene_linear_rgb,
@@ -336,6 +381,9 @@ def run_analysis(args) -> None:
         sensor_black_levels_rgb,
         sensor_white_levels_rgb,
     )
+    if white_field_params is not None:
+        normalized_full_rgb = apply_white_field_correction(normalized_full_rgb, white_field_params)
+    normalized_full_rgb = desaturate_highlights(normalized_full_rgb)
     if args.patch_variance_denoise and noise_profile is not None:
         normalized_full_rgb = denoise_linear_rgb(
             normalized_full_rgb,
@@ -419,6 +467,7 @@ def run_analysis(args) -> None:
                 "output_colorspace": args.output_colorspace,
                 "undistort": undistort_info if undistort_info is not None
                              else {"applied": False},
+                "white_field": white_field_params,
             },
             "selection": {"selected_k_regions": selected_k_regions},
             "diagnostics": {
@@ -533,7 +582,7 @@ def _process_single_raw(
     output_colorspace = settings.get("output_colorspace", OUTPUT_COLORSPACE)
     scene_white_xyz = np.asarray(settings["scene_white_xyz"], dtype=np.float64)
     output_paths: list[Path] = []
-    raw = src.load_raw_linear_rgb(raw_path)
+    raw = src.load_image_linear_rgb(raw_path)
     if settings.get("undistort", {}).get("applied", False):
         undistorted_rgb, undistort_info = try_undistort(raw.rgb, raw_path)
         if undistort_info is not None:
@@ -551,6 +600,10 @@ def _process_single_raw(
         sensor_black_levels_rgb,
         sensor_white_levels_rgb,
     )
+    white_field_params = settings.get("white_field")
+    if white_field_params:
+        normalized_full_rgb = apply_white_field_correction(normalized_full_rgb, white_field_params)
+    normalized_full_rgb = desaturate_highlights(normalized_full_rgb)
     noise_profile = diagnostics.get("noise_profile")
     if bool(settings.get("patch_variance_denoise", False)) and noise_profile is not None:
         normalized_full_rgb = denoise_linear_rgb(

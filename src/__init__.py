@@ -16,7 +16,14 @@ from .models import (
     fit_rpcc,
     fit_white_preserving_3x3,
 )
-from .raw import RawLinearImage, load_raw_linear_rgb
+from .raw import (
+    INPUT_SUFFIXES,
+    IMAGE_SUFFIXES,
+    RAW_SUFFIXES,
+    RawLinearImage,
+    load_image_linear_rgb,
+    load_raw_linear_rgb,
+)
 from .sampling import sample_patch_means, sample_patch_means_from_masks
 from .utils import load_reference_chroma, load_reference_lab, load_reference_rgb, load_reference_white_xyz, load_reference_xyy, load_reference_xyz
 
@@ -28,6 +35,9 @@ __all__ = [
     "HPPCCRPCCModel",
     "LinearWhitePreservingModel",
     "RPCCModel",
+    "INPUT_SUFFIXES",
+    "IMAGE_SUFFIXES",
+    "RAW_SUFFIXES",
     "RawLinearImage",
     "delta_e_2000",
     "fit_hppcc",
@@ -36,6 +46,7 @@ __all__ = [
     "fit_white_preserving_3x3",
     "hue_angle_from_rgb",
     "lab_to_xyz",
+    "load_image_linear_rgb",
     "load_raw_linear_rgb",
     "load_reference_chroma",
     "load_reference_lab",
