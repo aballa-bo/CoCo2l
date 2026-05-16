@@ -1850,7 +1850,7 @@ class BatchTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("HPPCC — Color Correction Tool")
+        self.setWindowTitle("CoCo2l - Color Correction Tool")
         self.setMinimumSize(1000, 860)
 
         self._denoise_cfg: dict = {

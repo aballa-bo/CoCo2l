@@ -1,7 +1,8 @@
 # coco2 — Color Correction Tool
 
-GUI + CLI tool for freely inspired HPPCC (Hue-Plane Preserving Color Correction - https://opg.optica.org/josaa/fulltext.cfm?uri=josaa-33-11-2166) + RPCC color correction
-on RAW and developed images, calibrated against an X-Rite ColorChecker Classic 24.
+GUI + CLI tool for freely inspired HPPCC (Hue-Plane Preserving Color Correction - https://opg.optica.org/josaa/fulltext.cfm?uri=josaa-33-11-2166) 
++ optional RPCC color correction on RAW and developed images, 
++ calibrated against an X-Rite ColorChecker Classic 24.
 
 ## Features
 
