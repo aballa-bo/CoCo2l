@@ -1278,8 +1278,9 @@ class ProcessTab(QWidget):
 class BatchTab(QWidget):
     COL_CC = 0
     COL_FOLDER = 1
-    COL_PROGRESS = 2
-    COL_STATUS = 3
+    COL_DEST = 2
+    COL_PROGRESS = 3
+    COL_STATUS = 4
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1331,9 +1332,9 @@ class BatchTab(QWidget):
         root.addLayout(top)
 
         # Table
-        self._table = QTableWidget(0, 4)
+        self._table = QTableWidget(0, 5)
         self._table.setHorizontalHeaderLabels(
-            ["Color checker image", "Folder to process", "Progress", "Status"]
+            ["Color checker image", "Folder to process", "Destination folder", "Progress", "Status"]
         )
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -1341,6 +1342,7 @@ class BatchTab(QWidget):
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(self.COL_CC, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(self.COL_FOLDER, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_DEST, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(self.COL_PROGRESS, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Fixed)
         self._table.setColumnWidth(self.COL_PROGRESS, 180)
@@ -1415,9 +1417,10 @@ class BatchTab(QWidget):
         if d:
             edit.setText(d)
 
-    def _add_row(self, cc_path: str = "", folder_path: str = "") -> None:
+    def _add_row(self, cc_path: str = "", folder_path: str = "", dest_path: str = "") -> None:
         cc_path = str(cc_path) if isinstance(cc_path, str) else ""
         folder_path = str(folder_path) if isinstance(folder_path, str) else ""
+        dest_path = str(dest_path) if isinstance(dest_path, str) else ""
 
         row = self._table.rowCount()
         self._table.insertRow(row)
@@ -1426,9 +1429,44 @@ class BatchTab(QWidget):
         cc_edit.setText(cc_path)
         self._table.setCellWidget(row, self.COL_CC, cc_widget)
 
-        folder_widget, folder_edit = self._make_path_cell("Folder to process...", self._pick_folder)
+        # Destination cell needs to be built first so the folder cell's autofill
+        # callback can reference it.
+        dest_widget, dest_edit = self._make_path_cell(
+            "Destination folder (defaults to <Folder>/Corrected)...", self._pick_folder,
+        )
+
+        # Folder cell built inline (instead of via _make_path_cell) so we can
+        # hook autofill into both editingFinished (typing) and Browse click.
+        folder_widget = QWidget()
+        folder_layout = QHBoxLayout(folder_widget)
+        folder_layout.setContentsMargins(2, 2, 2, 2)
+        folder_layout.setSpacing(4)
+        folder_edit = QLineEdit()
+        folder_edit.setPlaceholderText("Folder to process...")
+
+        def _autofill_dest() -> None:
+            if dest_edit.text().strip():
+                return
+            folder_val = folder_edit.text().strip()
+            if folder_val:
+                dest_edit.setText(str(Path(folder_val) / "Corrected"))
+
+        folder_edit.editingFinished.connect(_autofill_dest)
+        folder_btn = QPushButton("...")
+        folder_btn.setFixedWidth(28)
+        folder_btn.clicked.connect(
+            lambda _checked=False, e=folder_edit: (self._pick_folder(e), _autofill_dest())
+        )
+        folder_layout.addWidget(folder_edit, 1)
+        folder_layout.addWidget(folder_btn)
         folder_edit.setText(folder_path)
         self._table.setCellWidget(row, self.COL_FOLDER, folder_widget)
+
+        dest_edit.setText(dest_path)
+        self._table.setCellWidget(row, self.COL_DEST, dest_widget)
+        # If the row is created with a folder but no explicit destination, fill it now.
+        if folder_path and not dest_path:
+            _autofill_dest()
 
         progress = QProgressBar()
         progress.setRange(0, 1)
@@ -1465,6 +1503,10 @@ class BatchTab(QWidget):
         widget = self._table.cellWidget(row, self.COL_FOLDER)
         return widget.findChild(QLineEdit).text().strip() if widget else ""
 
+    def _row_dest(self, row: int) -> str:
+        widget = self._table.cellWidget(row, self.COL_DEST)
+        return widget.findChild(QLineEdit).text().strip() if widget else ""
+
     def _row_progress(self, row: int) -> QProgressBar:
         return self._table.cellWidget(row, self.COL_PROGRESS)
 
@@ -1478,7 +1520,11 @@ class BatchTab(QWidget):
 
     def collect_rows(self) -> list[dict]:
         return [
-            {"cc_image": self._row_cc(r), "folder": self._row_folder(r)}
+            {
+                "cc_image": self._row_cc(r),
+                "folder": self._row_folder(r),
+                "dest": self._row_dest(r),
+            }
             for r in range(self._table.rowCount())
         ]
 
@@ -1494,6 +1540,7 @@ class BatchTab(QWidget):
             self._add_row(
                 cc_path=str(entry.get("cc_image", "")),
                 folder_path=str(entry.get("folder", "")),
+                dest_path=str(entry.get("dest", "")),
             )
 
     # ── Batch run ──────────────────────────────────────────────────────────
@@ -1582,7 +1629,9 @@ class BatchTab(QWidget):
         pb.setRange(0, total)
         pb.setValue(0)
 
-        output_dir = str(Path(folder) / "Corrected")
+        # Destination: user override on the row, falling back to <folder>/Corrected.
+        dest_override = self._row_dest(self._current_row)
+        output_dir = dest_override or str(Path(folder) / "Corrected")
         args = [
             CC_SCRIPT, "process",
             correction_path, folder,
