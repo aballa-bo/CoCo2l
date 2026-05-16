@@ -655,7 +655,7 @@ def main(argv: list[str] | None = None) -> None:
         import sys
         from pathlib import Path as _Path
         sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
-        from app import main as gui_main
+        from coco2 import main as gui_main
         gui_main()
         return
     parser = build_parser()

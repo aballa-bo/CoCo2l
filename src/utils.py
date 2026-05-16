@@ -1,12 +1,44 @@
+import configparser
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import ImageCms
 
+from .config import PROJECT_ROOT
 from .models import HPPCCModel, HPPCCRPCCModel, LinearWhitePreservingModel, RPCCModel
+
+
+_EXIFTOOL_EXE = "exiftool.exe" if sys.platform == "win32" else "exiftool"
+
+
+def _resolve_exiftool() -> str:
+    """Pick which exiftool binary to call.
+
+    Resolution order:
+      1. `exiftool[.exe]` in the project root (next to coco2.py) — bundled
+         install, easiest to keep self-contained.
+      2. Path declared in `config.ini` under `[paths] exiftool = ...` —
+         escape hatch for non-standard locations or shared installs.
+      3. Plain "exiftool", relying on the system PATH.
+    """
+    local = PROJECT_ROOT / _EXIFTOOL_EXE
+    if local.is_file():
+        return str(local)
+    cfg_path = PROJECT_ROOT / "config.ini"
+    if cfg_path.is_file():
+        cfg = configparser.ConfigParser()
+        try:
+            cfg.read(cfg_path, encoding="utf-8")
+            override = cfg.get("paths", "exiftool", fallback="").strip().strip('"')
+            if override and Path(override).is_file():
+                return override
+        except (OSError, configparser.Error):
+            pass
+    return "exiftool"
 
 
 BRADFORD_MATRIX = np.array(
@@ -1046,8 +1078,9 @@ def load_analysis_result(path: Path) -> dict[str, object]:
 
 
 def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
+    import time
     command = [
-        "exiftool",
+        _resolve_exiftool(),
         "-m",                              # ignore minor warnings (otherwise exit code 1)
         "-charset", "filename=UTF8",       # interpret path args as UTF-8 (non-ASCII paths)
         "-charset", "utf8",                # tag values also UTF-8
@@ -1060,12 +1093,36 @@ def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
         "-MakerNotes:all",
         str(target_image_path),
     ]
-    completed = subprocess.run(command, check=False, capture_output=True)
-    if completed.returncode != 0:
-        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
-        stdout = completed.stdout.decode("utf-8", errors="replace").strip()
-        detail = stderr or stdout or f"exit code {completed.returncode}, no output"
-        raise RuntimeError(f"exiftool failed for {target_image_path}: {detail}")
+    # Retry transient failures: AV/OneDrive/file-locking can briefly steal the
+    # file right after we wrote it, and exiftool exits with code -1
+    # (DWORD 4294967295) when terminated externally. Two short retries usually
+    # cover that window.
+    last_returncode = None
+    last_stderr = b""
+    last_stdout = b""
+    for attempt in range(3):
+        completed = subprocess.run(command, check=False, capture_output=True)
+        if completed.returncode == 0:
+            return
+        last_returncode = completed.returncode
+        last_stderr = completed.stderr
+        last_stdout = completed.stdout
+        # Retry only on "killed/abnormal" exit codes; permanent failures bail out.
+        if completed.returncode not in (-1, 4294967295):
+            break
+        time.sleep(0.25 * (attempt + 1))
+
+    stderr = last_stderr.decode("utf-8", errors="replace").strip()
+    stdout = last_stdout.decode("utf-8", errors="replace").strip()
+    if last_returncode in (-1, 4294967295):
+        detail = (
+            f"exit code {last_returncode} (process terminated externally — likely "
+            f"OneDrive/antivirus locking the file). Try excluding the output folder "
+            f"from AV scans or pausing OneDrive sync during processing."
+        )
+    else:
+        detail = stderr or stdout or f"exit code {last_returncode}, no output"
+    raise RuntimeError(f"exiftool failed for {target_image_path}: {detail}")
 
 
 def to_uint8_image(rgb: np.ndarray) -> np.ndarray:
