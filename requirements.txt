@@ -1,0 +1,11 @@
+colour-checker-detection==0.2.1
+colour-science==0.4.6
+lensfunpy==1.18.0
+numpy==2.2.6
+opencv-python==4.13.0.92
+pillow==12.2.0
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.0
+PyQt6_sip==13.11.1
+rawpy==0.26.1
+scipy==1.15.3

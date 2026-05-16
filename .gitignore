@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local config
+config.ini
+settings.json
+.claude/
+docs/hppcc_analysis.md
+
+# Bundled binaries — users must install these themselves
+exiftool.exe
+exiftool
+exiftool_files/
+
+# Output / generated artifacts
+output/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
