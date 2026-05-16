@@ -2123,7 +2123,7 @@ def main() -> None:
         stream = getattr(sys, stream_name, None)
         if stream is not None and hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
             except (AttributeError, OSError):
                 pass
 

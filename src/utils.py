@@ -1103,6 +1103,10 @@ def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
     argfile = tempfile.NamedTemporaryFile(
         mode="w", suffix=".args", delete=False, encoding="utf-8", newline="\n",
     )
+    # CREATE_NO_WINDOW (Windows) prevents the brief console flash from
+    # exiftool.exe (a console-subsystem program) when invoked by our
+    # windowed GUI app. Harmless on non-Windows where the flag is unused.
+    creationflags = 0x08000000 if sys.platform == "win32" else 0
     try:
         argfile.write("\n".join(argfile_lines) + "\n")
         argfile.close()
@@ -1116,7 +1120,9 @@ def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
         last_stderr = b""
         last_stdout = b""
         for attempt in range(3):
-            completed = subprocess.run(command, check=False, capture_output=True)
+            completed = subprocess.run(
+                command, check=False, capture_output=True, creationflags=creationflags,
+            )
             if completed.returncode == 0:
                 return
             last_returncode = completed.returncode
