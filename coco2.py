@@ -16,13 +16,32 @@ from PyQt6.QtWidgets import (
     QRubberBand, QMessageBox, QGroupBox, QSizePolicy, QSplitter,
     QDialog, QDialogButtonBox, QScrollArea, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QTextBrowser, QWidgetAction,
 )
 from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal, QRect, QSize, QPoint, QEvent
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont, QAction
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-PYTHON = str(PROJECT_ROOT / ".venv" / "Scripts" / "python.exe")
-CC_SCRIPT = str(PROJECT_ROOT / "src" / "cc.py")
+if getattr(sys, "frozen", False):
+    # PyInstaller bundle: the executable itself dispatches to cc.main() when
+    # called with CLI args (see main() at the bottom), so we re-spawn ourselves
+    # instead of looking for a Python interpreter + the cc.py script.
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+    PYTHON = sys.executable
+    _CC_PREFIX: list[str] = []
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent
+    PYTHON = str(PROJECT_ROOT / ".venv" / "Scripts" / "python.exe")
+    CC_SCRIPT = str(PROJECT_ROOT / "src" / "cc.py")
+    _CC_PREFIX = [CC_SCRIPT]
+
+
+def _cc_args(*sub_args: str) -> list[str]:
+    """Build the args list for QProcess.start(PYTHON, ...).
+
+    Dev: [<src/cc.py>, <sub_args...>]
+    Frozen: [<sub_args...>] (the bundled exe dispatches to cc.main() itself).
+    """
+    return [*_CC_PREFIX, *sub_args]
 
 _EXT_MAP = {"jpeg": ".jpg", "tif": ".tif", "png": ".png"}
 
@@ -689,6 +708,91 @@ class HPPCCSettingsDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Help — How to (renders README.md) and About dialogs
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HowToDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("How to — coco2")
+        self.resize(820, 620)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        self._browser = QTextBrowser()
+        self._browser.setOpenExternalLinks(True)
+        from src.config import BUNDLE_DIR
+        readme_path = BUNDLE_DIR / "README.md"
+        if readme_path.is_file():
+            try:
+                self._browser.setMarkdown(readme_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self._browser.setPlainText(f"Could not render README.md: {exc}")
+        else:
+            self._browser.setPlainText(
+                "README.md is not bundled with this build. See the project repository."
+            )
+        layout.addWidget(self._browser, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        # The Close standard button is mapped to RejectRole; both rejected/accepted close.
+        buttons.clicked.connect(lambda _btn: self.accept())
+        layout.addWidget(buttons)
+
+
+class AboutDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("About coco2")
+        self.setFixedSize(420, 340)
+
+        from src import __version__
+        from src.config import BUNDLE_DIR
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        icon_label = QLabel()
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_path = BUNDLE_DIR / "assets" / "cocoicobn.png"
+        if icon_path.is_file():
+            pixmap = QPixmap(str(icon_path)).scaled(
+                96, 96,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            icon_label.setPixmap(pixmap)
+        layout.addWidget(icon_label)
+
+        text = QLabel(
+            f"<div style='text-align:center'>"
+            f"<h2 style='margin:0'>coco2</h2>"
+            f"<p style='margin:4px 0; color:#aaa'>Color Correction Tool</p>"
+            f"<p style='margin:6px 0'><b>Version {__version__}</b></p>"
+            f"<p style='margin:10px 0; font-size:11px'>"
+            f"HPPCC + RPCC color calibration from X-Rite<br>"
+            f"ColorChecker Classic 24, with RAW decoding,<br>"
+            f"highlight recovery, denoise, sharpening and<br>"
+            f"vignetting correction."
+            f"</p>"
+            f"</div>"
+        )
+        text.setTextFormat(Qt.TextFormat.RichText)
+        text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        text.setWordWrap(True)
+        layout.addWidget(text)
+
+        layout.addStretch()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Analyze tab
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -956,8 +1060,8 @@ class AnalyzeTab(QWidget):
         self._set_led_busy()
 
         out = self._output_dir.text().strip() or str(PROJECT_ROOT / "output")
-        args = [
-            CC_SCRIPT, "analyze",
+        args = _cc_args(
+            "analyze",
             "--cc-image", self._raw_path,
             "--analysis-dir", out,
             "--process-dir", out,
@@ -965,7 +1069,7 @@ class AnalyzeTab(QWidget):
             "--output-colorspace", self._cs.currentText(),
             "--no-show-detection-preview",
             "--no-show-developed-image-preview",
-        ]
+        )
         if self._nonlinear.isChecked():
             args.append("--perform-nonlinear-corrections")
         else:
@@ -1199,13 +1303,13 @@ class ProcessTab(QWidget):
         self._pause_btn.setEnabled(sys.platform == "win32")
         self._pause_btn.setText("⏸  Pause")
 
-        args = [
-            CC_SCRIPT, "process",
+        args = _cc_args(
+            "process",
             corr, src,
             "--output-format", self._fmt.currentText(),
             "--output-colorspace", self._cs.currentText(),
             "--workers", str(self._workers.value()),
-        ]
+        )
         out = self._out_edit.text().strip()
         if out:
             args += ["--process-dir", out]
@@ -1596,8 +1700,8 @@ class BatchTab(QWidget):
             return
 
         analysis_dir = str(Path(cc_path).parent / "analysis")
-        args = [
-            CC_SCRIPT, "analyze",
+        args = _cc_args(
+            "analyze",
             "--cc-image", cc_path,
             "--analysis-dir", analysis_dir,
             "--process-dir", analysis_dir,
@@ -1605,7 +1709,7 @@ class BatchTab(QWidget):
             "--output-colorspace", self._cs.currentText(),
             "--no-show-detection-preview",
             "--no-show-developed-image-preview",
-        ]
+        )
         args += self.denoise_args_provider()
         args += self.sharpen_args_provider()
         args += self.hppcc_args_provider()
@@ -1632,14 +1736,14 @@ class BatchTab(QWidget):
         # Destination: user override on the row, falling back to <folder>/Corrected.
         dest_override = self._row_dest(self._current_row)
         output_dir = dest_override or str(Path(folder) / "Corrected")
-        args = [
-            CC_SCRIPT, "process",
+        args = _cc_args(
+            "process",
             correction_path, folder,
             "--process-dir", output_dir,
             "--output-format", self._fmt.currentText(),
             "--output-colorspace", self._cs.currentText(),
             "--workers", str(self._workers.value()),
-        ]
+        )
 
         self._current_stage = "processing"
         self._output_buffer = ""
@@ -1903,6 +2007,31 @@ class MainWindow(QMainWindow):
 
         self._analyze._sharpen.toggled.connect(self._on_checkbox_sharpen_toggled)
 
+        # Expanding spacer so the Help menu lands on the right edge of the bar.
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        spacer_action = QWidgetAction(mb)
+        spacer_action.setDefaultWidget(spacer)
+        mb.addAction(spacer_action)
+
+        help_menu = mb.addMenu("Help")
+
+        howto_action = QAction("How to", self)
+        howto_action.triggered.connect(self._open_howto)
+        help_menu.addAction(howto_action)
+
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self._open_about)
+        help_menu.addAction(about_action)
+
+    def _open_howto(self) -> None:
+        dlg = HowToDialog(self)
+        dlg.exec()
+
+    def _open_about(self) -> None:
+        dlg = AboutDialog(self)
+        dlg.exec()
+
     def _on_menu_denoise_toggled(self, checked: bool) -> None:
         self._analyze._denoise.blockSignals(True)
         self._analyze._denoise.setChecked(checked)
@@ -1994,6 +2123,14 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
+    # Application icon. Looked up in BUNDLE_DIR/assets so it works for both dev
+    # runs (BUNDLE_DIR == project root) and frozen builds (BUNDLE_DIR == _MEIPASS).
+    from src.config import BUNDLE_DIR
+    from PyQt6.QtGui import QIcon
+    icon_path = BUNDLE_DIR / "assets" / "cocoicobn.png"
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
+
     from PyQt6.QtGui import QPalette
     pal = QPalette()
     pal.setColor(QPalette.ColorRole.Window, QColor(45, 45, 45))
@@ -2009,8 +2146,22 @@ def main() -> None:
 
     win = MainWindow()
     win.show()
+
+    # If launched from a PyInstaller bundle with a Splash screen, close it
+    # now that the main window is visible. Harmless no-op in dev runs.
+    try:
+        import pyi_splash  # type: ignore[import-not-found]
+        if pyi_splash.is_alive():
+            pyi_splash.close()
+    except (ImportError, Exception):
+        pass
+
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
+    # Required for PyInstaller-frozen builds so ProcessPoolExecutor workers
+    # don't re-run main() when they spawn. No-op on dev runs.
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

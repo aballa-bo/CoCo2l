@@ -1,11 +1,22 @@
+import sys
 from pathlib import Path
 
 import numpy as np
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Path layout. In a PyInstaller frozen build, read-only bundled data (assets,
+# reference values) lives under sys._MEIPASS while the executable and adjacent
+# files (exiftool.exe, config.ini, user output) sit alongside sys.executable.
+# In dev mode the two coincide with the repository root.
+if getattr(sys, "frozen", False):
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", str(Path(sys.executable).resolve().parent))).resolve()
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    BUNDLE_DIR = Path(__file__).resolve().parent.parent
+    PROJECT_ROOT = BUNDLE_DIR
+
 IMAGE_DIR = PROJECT_ROOT / "img"
-REFERENCE_PATH = PROJECT_ROOT / "assets" / "reference.json"
+REFERENCE_PATH = BUNDLE_DIR / "assets" / "reference.json"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 ANALYSIS_DIR = PROJECT_ROOT / "output" / "analysis"
 PROCESS_DIR = PROJECT_ROOT / "output" / "process"

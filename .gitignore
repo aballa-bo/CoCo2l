@@ -4,8 +4,12 @@ __pycache__/
 *$py.class
 *.egg-info/
 .Python
+
+# PyInstaller — intermediate artifacts and final bundle (the bundle is
+# attached to GitHub Releases by .github/workflows/release.yml).
 build/
 dist/
+*.manifest
 
 # Virtual environment
 .venv/

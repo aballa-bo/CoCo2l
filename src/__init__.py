@@ -1,5 +1,7 @@
 """Scientific core for hue-plane preserving color correction."""
 
+__version__ = "0.2"
+
 from .colorchecker import (
     CLASSIC_24_CHROMATIC_NAMES,
     CLASSIC_24_NEUTRAL_NAMES,

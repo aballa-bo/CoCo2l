@@ -440,6 +440,7 @@ def run_analysis(args) -> None:
         args.analysis_dir,
         raw_path,
         {
+            "app_version": src.__version__,
             "analysis_raw_path": str(raw_path),
             "settings": {
                 "white_index": int(args.white_index),
@@ -525,6 +526,13 @@ def run_analysis(args) -> None:
 
 def run_process(args) -> None:
     payload = load_analysis_result(args.result_json)
+    json_version = payload.get("app_version")
+    if json_version and json_version != src.__version__:
+        print(
+            f"Warning: correction file produced by coco2 {json_version}, "
+            f"running with {src.__version__}. Results may differ if the "
+            f"two versions are not fully compatible."
+        )
     settings = _merge_process_settings(payload["settings"], args)
     diagnostics = payload.get("diagnostics", {})
     models_payload = payload["models"]
