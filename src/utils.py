@@ -1078,12 +1078,19 @@ def load_analysis_result(path: Path) -> dict[str, object]:
 
 
 def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
+    import os
+    import tempfile
     import time
-    command = [
-        _resolve_exiftool(),
-        "-m",                              # ignore minor warnings (otherwise exit code 1)
-        "-charset", "filename=UTF8",       # interpret path args as UTF-8 (non-ASCII paths)
-        "-charset", "utf8",                # tag values also UTF-8
+
+    # Build a UTF-8 argfile and call exiftool via `-@`. Passing paths as
+    # CLI args makes the Windows CRT in exiftool.exe convert them to the
+    # ANSI codepage, mangling non-ASCII components (e.g. "Università") to
+    # "Universit?". Reading args from a UTF-8 file with explicit
+    # `-charset filename=UTF8` bypasses that conversion completely.
+    argfile_lines = [
+        "-m",                              # ignore minor warnings
+        "-charset", "filename=UTF8",       # filenames in this file are UTF-8
+        "-charset", "utf8",                # tag values are UTF-8
         "-overwrite_original",
         "-TagsFromFile",
         str(source_raw_path),
@@ -1093,36 +1100,48 @@ def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
         "-MakerNotes:all",
         str(target_image_path),
     ]
-    # Retry transient failures: AV/OneDrive/file-locking can briefly steal the
-    # file right after we wrote it, and exiftool exits with code -1
-    # (DWORD 4294967295) when terminated externally. Two short retries usually
-    # cover that window.
-    last_returncode = None
-    last_stderr = b""
-    last_stdout = b""
-    for attempt in range(3):
-        completed = subprocess.run(command, check=False, capture_output=True)
-        if completed.returncode == 0:
-            return
-        last_returncode = completed.returncode
-        last_stderr = completed.stderr
-        last_stdout = completed.stdout
-        # Retry only on "killed/abnormal" exit codes; permanent failures bail out.
-        if completed.returncode not in (-1, 4294967295):
-            break
-        time.sleep(0.25 * (attempt + 1))
+    argfile = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".args", delete=False, encoding="utf-8", newline="\n",
+    )
+    try:
+        argfile.write("\n".join(argfile_lines) + "\n")
+        argfile.close()
+        command = [_resolve_exiftool(), "-@", argfile.name]
 
-    stderr = last_stderr.decode("utf-8", errors="replace").strip()
-    stdout = last_stdout.decode("utf-8", errors="replace").strip()
-    if last_returncode in (-1, 4294967295):
-        detail = (
-            f"exit code {last_returncode} (process terminated externally — likely "
-            f"OneDrive/antivirus locking the file). Try excluding the output folder "
-            f"from AV scans or pausing OneDrive sync during processing."
-        )
-    else:
-        detail = stderr or stdout or f"exit code {last_returncode}, no output"
-    raise RuntimeError(f"exiftool failed for {target_image_path}: {detail}")
+        # Retry transient failures: AV/OneDrive/file-locking can briefly steal
+        # the file right after we wrote it, and exiftool exits with code -1
+        # (DWORD 4294967295) when terminated externally. Two short retries
+        # usually cover that window.
+        last_returncode = None
+        last_stderr = b""
+        last_stdout = b""
+        for attempt in range(3):
+            completed = subprocess.run(command, check=False, capture_output=True)
+            if completed.returncode == 0:
+                return
+            last_returncode = completed.returncode
+            last_stderr = completed.stderr
+            last_stdout = completed.stdout
+            if completed.returncode not in (-1, 4294967295):
+                break
+            time.sleep(0.25 * (attempt + 1))
+
+        stderr = last_stderr.decode("utf-8", errors="replace").strip()
+        stdout = last_stdout.decode("utf-8", errors="replace").strip()
+        if last_returncode in (-1, 4294967295):
+            detail = (
+                f"exit code {last_returncode} (process terminated externally — likely "
+                f"OneDrive/antivirus locking the file). Try excluding the output folder "
+                f"from AV scans or pausing OneDrive sync during processing."
+            )
+        else:
+            detail = stderr or stdout or f"exit code {last_returncode}, no output"
+        raise RuntimeError(f"exiftool failed for {target_image_path}: {detail}")
+    finally:
+        try:
+            os.unlink(argfile.name)
+        except OSError:
+            pass
 
 
 def to_uint8_image(rgb: np.ndarray) -> np.ndarray:

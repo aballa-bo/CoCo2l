@@ -657,6 +657,16 @@ def _process_single_raw(
 
 def main(argv: list[str] | None = None) -> None:
     import sys as _sys
+    # Reconfigure stdio to UTF-8 with replacement on encode errors, so that
+    # printing paths or error messages containing non-cp1252 characters does
+    # not crash with UnicodeEncodeError.
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(_sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError):
+                pass
     effective_argv = argv if argv is not None else _sys.argv[1:]
     if not effective_argv:
         # No arguments — launch the GUI

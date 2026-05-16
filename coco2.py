@@ -2115,6 +2115,18 @@ class MainWindow(QMainWindow):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Force UTF-8 on stdio so that error messages containing non-ASCII path
+    # components (e.g. "Università") or the U+FFFD replacement character
+    # don't crash with UnicodeEncodeError when stdout is on cp1252 (default
+    # locale on Italian Windows). `errors='replace'` is the safety net.
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError):
+                pass
+
     if len(sys.argv) > 1:
         from src.cc import main as cc_main
         cc_main()
