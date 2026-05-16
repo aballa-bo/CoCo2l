@@ -25,7 +25,6 @@ env/
 # Local config
 config.ini
 settings.json
-.claude/
 docs/hppcc_analysis.md
 
 # Bundled binaries — users must install these themselves
