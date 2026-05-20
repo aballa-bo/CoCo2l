@@ -83,6 +83,8 @@ from src.utils import (
     copy_exif_from_raw,
     denoise_linear_rgb,
     desaturate_highlights,
+    highlight_blowout_weight,
+    neutralize_blown_highlights,
     delta_e00_summary,
     estimate_scene_white_from_camera_wb,
     estimate_scene_white_from_neutral_patches,
@@ -383,6 +385,7 @@ def run_analysis(args) -> None:
     )
     if white_field_params is not None:
         normalized_full_rgb = apply_white_field_correction(normalized_full_rgb, white_field_params)
+    blown_highlight_weight = highlight_blowout_weight(normalized_full_rgb)
     normalized_full_rgb = desaturate_highlights(normalized_full_rgb)
     if args.patch_variance_denoise and noise_profile is not None:
         normalized_full_rgb = denoise_linear_rgb(
@@ -418,6 +421,7 @@ def run_analysis(args) -> None:
         )
         output_label = "hppcc"
     corrected_full_output_rgb = render_xyz_to_display(corrected_full_xyz, scene_white_xyz, args.output_colorspace)
+    corrected_full_output_rgb = neutralize_blown_highlights(corrected_full_output_rgb, blown_highlight_weight)
     corrected_full_uint8 = to_uint8_image(corrected_full_output_rgb)
     ext = output_extension(args.output_format)
     icc_bytes = get_icc_profile_bytes(args.output_colorspace)
@@ -611,6 +615,7 @@ def _process_single_raw(
     white_field_params = settings.get("white_field")
     if white_field_params:
         normalized_full_rgb = apply_white_field_correction(normalized_full_rgb, white_field_params)
+    blown_highlight_weight = highlight_blowout_weight(normalized_full_rgb)
     normalized_full_rgb = desaturate_highlights(normalized_full_rgb)
     noise_profile = diagnostics.get("noise_profile")
     if bool(settings.get("patch_variance_denoise", False)) and noise_profile is not None:
@@ -644,6 +649,7 @@ def _process_single_raw(
             model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width
         )
     corrected_full_output_rgb = render_xyz_to_display(corrected_full_xyz, scene_white_xyz, output_colorspace)
+    corrected_full_output_rgb = neutralize_blown_highlights(corrected_full_output_rgb, blown_highlight_weight)
     corrected_full_uint8 = to_uint8_image(corrected_full_output_rgb)
     output_path = output_dir / f"{raw_path.stem}{extension}"
     save_named_corrected_image(output_path, corrected_full_uint8, icc_profile_bytes)

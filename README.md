@@ -95,9 +95,17 @@ All CLI flags are documented through `python coco2.py analyze --help` and
   sits next to it.
 - **`No ColorChecker detected`** — switch to the ROI tool in Analysis to outline the
   chart area manually, then run again.
-- **Magenta tint on specular highlights** — already mitigated by `HighlightMode.Blend`
-  (rawpy) + `desaturate_highlights` + HPPCC blending. If the artefact persists, increase
-  the HPPCC blend width via `HPPCC → HPPCC settings...` (try 0.20–0.25).
+- **Magenta/pink tint on over-exposed areas** — mitigated in three stages:
+  `rawpy.HighlightMode.Blend` (raw decode) → `desaturate_highlights` (linear sensor RGB,
+  before HPPCC) → `neutralize_blown_highlights` (display RGB, after colour correction).
+  The last stage removes the cast that HPPCC/RPCC re-introduces when it extrapolates
+  clipped highlights past its training range: a blown-pixel weight is computed from the
+  *sensor* RGB by `highlight_blowout_weight` (any channel near the clip ceiling) and the
+  matching pixels are forced toward white in the final image. If the artefact still
+  persists, lower the `threshold`/`full` parameters of `highlight_blowout_weight` in
+  `src/utils.py` (e.g. `threshold=0.88`); if instead bright saturated colours look
+  washed out, raise `threshold`. Note that raising the HPPCC blend width does **not**
+  help here — it only smooths hue-region boundaries, not highlight extrapolation.
 
 ## Project layout
 

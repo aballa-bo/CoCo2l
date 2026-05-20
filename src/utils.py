@@ -681,6 +681,53 @@ def desaturate_highlights(rgb: np.ndarray, *, threshold: float = 0.93) -> np.nda
     return rgb * (1.0 - blend) + max_channel * blend
 
 
+def highlight_blowout_weight(
+    sensor_rgb: np.ndarray,
+    *,
+    threshold: float = 0.93,
+    full: float = 0.99,
+) -> np.ndarray:
+    """Per-pixel weight in [0, 1] marking over-exposed (clipped) pixels.
+
+    Computed on the *sensor* RGB, before HPPCC/RPCC. Driven by the *brightest*
+    channel, with the same threshold as `desaturate_highlights`: a pixel gets a
+    non-zero weight exactly when at least one channel is near the clip ceiling,
+    i.e. whenever `desaturate_highlights` neutralised it on input. Those are the
+    pixels HPPCC then extrapolates past its training range and renders with a
+    magenta/green cast. A partially clipped highlight (only one channel at the
+    ceiling, the classic magenta-fringe case) has a high *maximum* even though
+    its minimum is moderate, so it is caught here — a minimum-driven test would
+    miss it. The weight ramps from `threshold` (0) to `full` (1).
+    """
+    sensor_rgb = np.asarray(sensor_rgb, dtype=np.float64)
+    max_channel = np.max(sensor_rgb, axis=-1)
+    denom = max(float(full) - float(threshold), 1e-12)
+    return np.clip((max_channel - float(threshold)) / denom, 0.0, 1.0)
+
+
+def neutralize_blown_highlights(
+    display_rgb: np.ndarray,
+    weight: np.ndarray,
+) -> np.ndarray:
+    """Blend over-exposed pixels toward neutral white in display RGB.
+
+    Runs on the final display RGB, after colour correction. HPPCC/RPCC
+    extrapolates clipped highlights far past its training range (the brightest
+    neutral chart patch sits well below the clip ceiling) and re-introduces a
+    magenta/green cast on blown areas — even when those pixels were neutralised
+    on the sensor side by `desaturate_highlights`.
+
+    `weight` (see `highlight_blowout_weight`) is derived from the *sensor* RGB,
+    so the blown-pixel decision uses the true clip state instead of the HPPCC
+    output — whose hue is exactly the artefact being removed. Blown pixels are
+    forced toward pure white, which is the correct rendering for a clipped
+    highlight.
+    """
+    display_rgb = np.asarray(display_rgb, dtype=np.float64)
+    weight = np.asarray(weight, dtype=np.float64)[..., None]
+    return display_rgb * (1.0 - weight) + weight
+
+
 def _extract_patch_pixels(
     image: np.ndarray,
     center: np.ndarray,
