@@ -22,6 +22,9 @@ env/
 *.swp
 *.swo
 
+# Claude Code — per-machine local settings
+.claude/
+
 # Local config
 config.ini
 settings.json
