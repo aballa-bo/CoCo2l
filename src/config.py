@@ -31,6 +31,14 @@ USE_METADATA_RGB_XYZ_BASELINE = True
 # the per-pixel linear fallback (below) carries the out-of-range tones.
 MIN_WHITE_PATCH_LEVEL = 0.25
 
+# HPPCC region-matrix smoothness. Tikhonov weight penalising the difference
+# between adjacent regions' 3x3 matrices during the fit. Without it each region
+# over-fits its handful of ColorChecker patches and the matrices diverge, so
+# even a perfectly smooth hue blend still shows a residual colour transition.
+# Higher = adjacent matrices kept closer (smoother images) at a small cost in
+# chart accuracy; 0 disables it. Exposed in the GUI via HPPCC > HPPCC settings.
+HPPCC_REGION_SMOOTHNESS = 0.0
+
 # Out-of-training-range fallback. HPPCC/RPCC extrapolate badly above the
 # brightest fitted patch value; the white-preserving linear matrix degrades
 # gracefully. Per pixel the output ramps from HPPCC/RPCC to the linear

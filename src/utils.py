@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import ImageCms
 
-from .config import PROJECT_ROOT
+from .config import HPPCC_REGION_SMOOTHNESS, PROJECT_ROOT
 from .models import HPPCCModel, HPPCCRPCCModel, LinearWhitePreservingModel, RPCCModel
 
 
@@ -1248,6 +1248,7 @@ def summarize_model(
     optimize_boundaries: bool = False,
     use_hppcc_blending: bool = False,
     hppcc_blend_width: float = 0.15,
+    region_smoothness: float = HPPCC_REGION_SMOOTHNESS,
     perform_nonlinear_corrections: bool = True,
     reference_chroma: np.ndarray | None = None,
     reliable_patch_indices: np.ndarray | None = None,
@@ -1314,6 +1315,7 @@ def summarize_model(
         chromatic_indices=chromatic_indices_train,
         k_regions=hppcc_regions,
         optimize_boundaries=optimize_boundaries,
+        region_smoothness=region_smoothness,
     )
     hppcc_xyz = predict_hppcc(hppcc, measured_rgb, use_blending=use_hppcc_blending, blend_width=hppcc_blend_width)
     hppcc_de00 = delta_e00_summary(src_module, hppcc_xyz, reference_xyz, illuminant_white)
@@ -1331,6 +1333,7 @@ def summarize_model(
             chromatic_indices=chromatic_indices_train,
             k_regions=hppcc_regions,
             optimize_boundaries=optimize_boundaries,
+            region_smoothness=region_smoothness,
         )
         hppcc_rpcc_xyz = predict_hppcc_rpcc(
             hppcc_rpcc, measured_rgb, use_blending=use_hppcc_blending, blend_width=hppcc_blend_width

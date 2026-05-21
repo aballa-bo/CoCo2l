@@ -16,6 +16,7 @@ from src.config import (
     ENABLE_PROCESS_WHITE_FIELD,
     HPPCC_BLEND_WIDTH,
     HPPCC_REGION_CANDIDATES,
+    HPPCC_REGION_SMOOTHNESS,
     IMAGE_DIR,
     OUTPUT_COLORSPACE,
     OUTPUT_FORMAT,
@@ -192,6 +193,13 @@ def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defau
         type=float,
         default=HPPCC_BLEND_WIDTH if use_defaults else None,
         help="Blend width fraction for HPPCC soft prediction.",
+    )
+    parser.add_argument(
+        "--hppcc-region-smoothness",
+        type=float,
+        default=HPPCC_REGION_SMOOTHNESS if use_defaults else None,
+        help="Tikhonov weight coupling adjacent HPPCC region matrices during "
+             "the fit; higher = smoother hue transitions, 0 disables (analyze only).",
     )
     parser.add_argument(
         "--perform-nonlinear-corrections",
