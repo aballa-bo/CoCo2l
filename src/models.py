@@ -7,6 +7,7 @@ from itertools import combinations
 
 import numpy as np
 
+from .config import HPPCC_REGION_SMOOTHNESS
 from .metrics import hue_angle_from_rgb
 
 
@@ -82,22 +83,33 @@ class HPPCCModel:
 
         full_boundaries = np.concatenate([boundaries, [2.0 * np.pi]])
         centers = np.empty(k_regions, dtype=np.float64)
-        widths = np.empty(k_regions, dtype=np.float64)
         for region in range(k_regions):
             start = full_boundaries[region]
             end = full_boundaries[region + 1]
-            widths[region] = end - start
-            centers[region] = start + 0.5 * widths[region]
+            centers[region] = start + 0.5 * (end - start)
 
+        # Gaussian partition of unity over hue angle. Each region's matrix is
+        # weighted by a Gaussian of the angular distance from its centre, then
+        # the weights are normalised. A Gaussian is positive everywhere, so
+        # adjacent regions always overlap and the blend crosses every region
+        # boundary smoothly (C-infinity) — no hard region assignment, no
+        # two-tone seam. The earlier triangular kernel had compact support
+        # scaled by region width: near a boundary every weight could clip to
+        # zero, forcing a hard fallback and a visible discontinuity (badly so
+        # for narrow regions). `blend_width` scales sigma relative to the mean
+        # region width (2*pi / k): larger = softer transition.
         if np.isscalar(blend_width):
             blend_fraction = float(blend_width)
             if blend_fraction <= 0.0:
                 return self.predict(rgb)
-            blend_halfwidths = 0.5 * blend_fraction * widths
+            sigmas = np.full(
+                k_regions, blend_fraction * (2.0 * np.pi / k_regions), dtype=np.float64
+            )
         else:
-            blend_halfwidths = np.asarray(blend_width, dtype=np.float64)
-            if blend_halfwidths.shape != (k_regions,):
+            sigmas = np.asarray(blend_width, dtype=np.float64)
+            if sigmas.shape != (k_regions,):
                 raise ValueError("blend_width must be a scalar or have one value per region.")
+        sigmas = np.maximum(sigmas, 1e-12)
 
         predictions = np.empty((k_regions, flat.shape[0], 3), dtype=np.float64)
         for region in range(k_regions):
@@ -105,17 +117,15 @@ class HPPCCModel:
 
         delta = np.abs(angles[np.newaxis, :] - centers[:, np.newaxis])
         delta = np.minimum(delta, 2.0 * np.pi - delta)
-        safe_halfwidths = np.maximum(blend_halfwidths[:, np.newaxis], 1e-12)
-        weights = np.clip(1.0 - delta / safe_halfwidths, 0.0, 1.0)
-
-        if np.any(blend_halfwidths <= 0.0):
-            zero_mask = blend_halfwidths <= 0.0
-            weights[zero_mask] = 0.0
+        weights = np.exp(-0.5 * (delta / sigmas[:, np.newaxis]) ** 2)
 
         normalizer = np.sum(weights, axis=0, keepdims=True)
-        hard_region_indices = np.searchsorted(boundaries, angles, side="right") % k_regions
+        # Degenerate guard: with a very small blend_width every Gaussian can
+        # underflow to zero for a pixel far from all centres. Fall back to the
+        # hard region assignment there so the output stays well-defined.
         hard_mask = normalizer[0] <= 1e-12
         if np.any(hard_mask):
+            hard_region_indices = np.searchsorted(boundaries, angles, side="right") % k_regions
             weights[:, hard_mask] = 0.0
             weights[hard_region_indices[hard_mask], np.flatnonzero(hard_mask)] = 1.0
             normalizer = np.sum(weights, axis=0, keepdims=True)
@@ -149,10 +159,14 @@ def _fit_hppcc_constrained(
     region_ids: np.ndarray,
     white_rgb: np.ndarray,
     white_xyz: np.ndarray,
+    lam: float = HPPCC_REGION_SMOOTHNESS,
 ) -> np.ndarray:
     """Fit K regional 3×3 matrices with boundary-continuity and white-point constraints.
 
-    Returns matrices of shape (K, 3, 3).
+    `lam` adds a Tikhonov penalty ``lam * sum ||M_r - M_{r+1}||^2`` over
+    cyclically adjacent region pairs, keeping the matrices from over-fitting
+    their few patches and diverging (which would show as a colour transition
+    even under a smooth hue blend). Returns matrices of shape (K, 3, 3).
     """
     k_regions = len(boundaries)
     n = len(q_sorted)
@@ -187,6 +201,20 @@ def _fit_hppcc_constrained(
     c[-1, 0:3] = white_rgb
     b[-1] = white_xyz
 
+    if lam > 0.0 and k_regions >= 2:
+        # Couple adjacent regions: extra least-squares rows whose residual is
+        # sqrt(lam) * (M_r - M_{r+1}), targeting zero. Each row block r spans
+        # the matrix blocks of regions r and (r+1) mod K.
+        root_lam = np.sqrt(float(lam))
+        penalty = np.zeros((3 * k_regions, 3 * k_regions), dtype=np.float64)
+        for region in range(k_regions):
+            next_region = (region + 1) % k_regions
+            rows = slice(3 * region, 3 * (region + 1))
+            penalty[rows, 3 * region : 3 * (region + 1)] = root_lam * np.eye(3)
+            penalty[rows, 3 * next_region : 3 * (next_region + 1)] = -root_lam * np.eye(3)
+        a = np.vstack([a, penalty])
+        p_sorted = np.vstack([p_sorted, np.zeros((3 * k_regions, 3), dtype=np.float64)])
+
     t = _solve_constrained_least_squares(a, p_sorted, c, b)
     return t.reshape(k_regions, 3, 3)
 
@@ -199,6 +227,7 @@ def _exhaustive_boundary_search(
     white_rgb: np.ndarray,
     white_xyz: np.ndarray,
     min_per_region: int = 1,
+    lam: float = HPPCC_REGION_SMOOTHNESS,
 ) -> np.ndarray:
     """Find hue boundaries minimising constrained LS residual via exhaustive split search.
 
@@ -228,7 +257,9 @@ def _exhaustive_boundary_search(
             continue
 
         try:
-            matrices = _fit_hppcc_constrained(q_sorted, p_sorted, bounds, region_ids, white_rgb, white_xyz)
+            matrices = _fit_hppcc_constrained(
+                q_sorted, p_sorted, bounds, region_ids, white_rgb, white_xyz, lam=lam
+            )
         except np.linalg.LinAlgError:
             continue
 
@@ -251,6 +282,7 @@ def fit_hppcc(
     chromatic_indices: np.ndarray | list[int],
     k_regions: int = 4,
     optimize_boundaries: bool = False,
+    region_smoothness: float = HPPCC_REGION_SMOOTHNESS,
 ) -> HPPCCModel:
     """Fit the 2016 constrained least-squares HPPCC model.
 
@@ -281,7 +313,7 @@ def fit_hppcc(
         if optimize_boundaries:
             boundaries = _exhaustive_boundary_search(
                 q_sorted, p_sorted, angles_sorted, k_regions, white_rgb, white_xyz,
-                min_per_region=3,
+                min_per_region=3, lam=region_smoothness,
             )
         else:
             boundaries = _equal_count_boundaries(angles_sorted, k_regions)
@@ -294,7 +326,9 @@ def fit_hppcc(
     else:
         raise ValueError("Hue partitioning produced an empty region even with k_regions=2.")
 
-    matrices = _fit_hppcc_constrained(q_sorted, p_sorted, boundaries, region_ids, white_rgb, white_xyz)
+    matrices = _fit_hppcc_constrained(
+        q_sorted, p_sorted, boundaries, region_ids, white_rgb, white_xyz, lam=region_smoothness
+    )
     return HPPCCModel(
         matrices=matrices,
         boundaries=boundaries,
@@ -393,6 +427,7 @@ def fit_hppcc_rpcc(
     chromatic_indices: np.ndarray | list[int],
     k_regions: int = 4,
     optimize_boundaries: bool = False,
+    region_smoothness: float = HPPCC_REGION_SMOOTHNESS,
 ) -> HPPCCRPCCModel:
     """Fit the inverted two-stage HPPCC + RPCC model.
 
@@ -409,6 +444,7 @@ def fit_hppcc_rpcc(
         chromatic_indices=chromatic_indices,
         k_regions=k_regions,
         optimize_boundaries=optimize_boundaries,
+        region_smoothness=region_smoothness,
     )
     xyz_hppcc = hppcc.predict(rgb)
     xyz_residual = xyz - xyz_hppcc

@@ -693,6 +693,18 @@ class HPPCCSettingsDialog(QDialog):
         self._blend_width.setValue(cfg.get("blend_width", 0.15))
         form.addRow("Blend width:", self._blend_width)
 
+        self._region_smoothness = QDoubleSpinBox()
+        self._region_smoothness.setRange(0.0, 1.0)
+        self._region_smoothness.setSingleStep(0.005)
+        self._region_smoothness.setDecimals(3)
+        self._region_smoothness.setValue(cfg.get("region_smoothness", 0.0))
+        self._region_smoothness.setToolTip(
+            "Couples adjacent hue-region matrices during analysis.\n"
+            "Higher = smoother hue transitions but flatter colour detail; "
+            "0 disables it. Applied when analysing a chart."
+        )
+        form.addRow("Region smoothness:", self._region_smoothness)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -704,7 +716,10 @@ class HPPCCSettingsDialog(QDialog):
         root.addWidget(buttons)
 
     def get_settings(self) -> dict:
-        return {"blend_width": self._blend_width.value()}
+        return {
+            "blend_width": self._blend_width.value(),
+            "region_smoothness": self._region_smoothness.value(),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1867,6 +1882,7 @@ class MainWindow(QMainWindow):
         self._hppcc_cfg: dict = {
             "use_blending": True,
             "blend_width": 0.15,
+            "region_smoothness": 0.0,
         }
 
         self._tabs = QTabWidget()
@@ -2095,12 +2111,17 @@ class MainWindow(QMainWindow):
 
     def get_hppcc_args(self) -> list[str]:
         cfg = self._hppcc_cfg
+        # Region smoothness affects the fit regardless of blending, so it is
+        # always passed.
+        args = ["--hppcc-region-smoothness", str(cfg.get("region_smoothness", 0.0))]
         if cfg.get("use_blending", True):
-            return [
+            args += [
                 "--use-hppcc-blending",
                 "--hppcc-blend-width", str(cfg.get("blend_width", 0.15)),
             ]
-        return ["--no-use-hppcc-blending"]
+        else:
+            args += ["--no-use-hppcc-blending"]
+        return args
 
     # ── slots ─────────────────────────────────────────────────────────────
 
