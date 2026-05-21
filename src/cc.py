@@ -37,6 +37,8 @@ from src.config import (
     HPPCC_BLEND_WIDTH,
     HPPCC_REGION_CANDIDATES,
     IMAGE_DIR,
+    LINEAR_FALLBACK_RANGE_FACTOR,
+    MIN_WHITE_PATCH_LEVEL,
     OUTPUT_COLORSPACE,
     OUTPUT_FORMAT,
     PERFORM_NONLINEAR_CORRECTIONS,
@@ -75,6 +77,7 @@ from src.report import (
 )
 from src.utils import (
     apply_matrix_transform,
+    blend_model_with_linear_fallback,
     apply_white_field_correction,
     apply_white_field_correction_to_patches,
     analyze_neutral_illuminant_gradient,
@@ -96,6 +99,7 @@ from src.utils import (
     hppcc_rpcc_model_from_dict,
     hppcc_rpcc_model_to_dict,
     identify_unreliable_patches,
+    linear_model_from_dict,
     linear_model_to_dict,
     load_reference_chroma,
     load_reference_white_xyz,
@@ -194,6 +198,26 @@ def run_analysis(args) -> None:
         sensor_black_levels_rgb,
         sensor_white_levels_rgb,
     )
+
+    # Detect a severely under-exposed chart. The white patch is the brightest
+    # neutral training sample, so it bounds the tonal range the HPPCC/RPCC
+    # model is fitted on. When it sits very low the model is fitted on shadows
+    # only and its piecewise/polynomial terms are numerically unstable across
+    # the *whole* range — not just above the white patch. In that case the
+    # robust white-preserving linear baseline is used for the full image
+    # instead (see the prediction step below).
+    white_patch_level = float(np.max(normalized_rgb[int(args.white_index)]))
+    chart_underexposed = white_patch_level < MIN_WHITE_PATCH_LEVEL
+    if chart_underexposed:
+        print(
+            f"\nWARNING: ColorChecker is under-exposed — the white patch reaches "
+            f"only {white_patch_level * 100:.1f}% of sensor full scale "
+            f"(recommended: at least {MIN_WHITE_PATCH_LEVEL * 100:.0f}%).\n"
+            f"  HPPCC/RPCC would be unreliable; the linear baseline correction "
+            f"will be used for the full image instead.\n"
+            f"  For best accuracy re-shoot the chart brighter — aim for the white "
+            f"patch around 60-90% of full scale, without clipping.\n"
+        )
 
     white_field_params = None
     if getattr(args, "process_white_field", False):
@@ -420,6 +444,23 @@ def run_analysis(args) -> None:
             blend_width=args.hppcc_blend_width,
         )
         output_label = "hppcc"
+    # Under-exposed chart: HPPCC/RPCC is unreliable everywhere, use the linear
+    # baseline for the whole image. Otherwise keep HPPCC/RPCC but fade to the
+    # linear baseline above the fitted tonal range, so out-of-range highlights
+    # stay sane instead of casting.
+    training_max_rgb = float(np.max(corrected_rgb))
+    linear_full_xyz = best["baseline"].predict(normalized_full_rgb)
+    if chart_underexposed:
+        corrected_full_xyz = linear_full_xyz
+        output_label = "baseline"
+    else:
+        corrected_full_xyz = blend_model_with_linear_fallback(
+            corrected_full_xyz,
+            linear_full_xyz,
+            normalized_full_rgb,
+            training_max_rgb,
+            full_fallback_factor=LINEAR_FALLBACK_RANGE_FACTOR,
+        )
     corrected_full_output_rgb = render_xyz_to_display(corrected_full_xyz, scene_white_xyz, args.output_colorspace)
     corrected_full_output_rgb = neutralize_blown_highlights(corrected_full_output_rgb, blown_highlight_weight)
     corrected_full_uint8 = to_uint8_image(corrected_full_output_rgb)
@@ -465,6 +506,8 @@ def run_analysis(args) -> None:
                 "sharpen_radius": float(args.sharpen_radius),
                 "sharpen_threshold": float(args.sharpen_threshold),
                 "use_metadata_rgb_xyz_baseline": bool(args.use_metadata_rgb_xyz_baseline),
+                "training_max_rgb": training_max_rgb,
+                "use_linear_only": bool(chart_underexposed),
                 "use_hppcc_blending": bool(args.use_hppcc_blending),
                 "hppcc_blend_width": float(args.hppcc_blend_width),
                 "perform_nonlinear_corrections": bool(args.perform_nonlinear_corrections),
@@ -638,15 +681,37 @@ def _process_single_raw(
     extension = output_extension(settings.get("output_format", OUTPUT_FORMAT))
     icc_profile_bytes = get_icc_profile_bytes(settings.get("output_colorspace", OUTPUT_COLORSPACE))
 
-    if use_nonlinear:
-        model = hppcc_rpcc_model_from_dict(models_payload["hppcc_rpcc"])
-        corrected_full_xyz = predict_hppcc_rpcc(
-            model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width
-        )
+    # `use_linear_only` (under-exposed chart) and `training_max_rgb` are absent
+    # from correction files written before v0.2.4 — default to the HPPCC path
+    # and fall back to the white patch level, which bounds the training range.
+    baseline_model = linear_model_from_dict(models_payload["baseline"])
+    if bool(settings.get("use_linear_only", False)):
+        # Under-exposed chart: HPPCC/RPCC unreliable everywhere — linear only.
+        corrected_full_xyz = baseline_model.predict(normalized_full_rgb)
     else:
-        model = hppcc_model_from_dict(models_payload["hppcc"])
-        corrected_full_xyz = predict_hppcc(
-            model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width
+        if use_nonlinear:
+            model = hppcc_rpcc_model_from_dict(models_payload["hppcc_rpcc"])
+            corrected_full_xyz = predict_hppcc_rpcc(
+                model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width
+            )
+        else:
+            model = hppcc_model_from_dict(models_payload["hppcc"])
+            corrected_full_xyz = predict_hppcc(
+                model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width
+            )
+        # Fade to the linear baseline above the fitted tonal range so
+        # out-of-range highlights stay sane instead of casting.
+        training_max_rgb = settings.get("training_max_rgb")
+        training_max_rgb = (
+            float(np.max(baseline_model.white_rgb))
+            if training_max_rgb is None else float(training_max_rgb)
+        )
+        corrected_full_xyz = blend_model_with_linear_fallback(
+            corrected_full_xyz,
+            baseline_model.predict(normalized_full_rgb),
+            normalized_full_rgb,
+            training_max_rgb,
+            full_fallback_factor=LINEAR_FALLBACK_RANGE_FACTOR,
         )
     corrected_full_output_rgb = render_xyz_to_display(corrected_full_xyz, scene_white_xyz, output_colorspace)
     corrected_full_output_rgb = neutralize_blown_highlights(corrected_full_output_rgb, blown_highlight_weight)

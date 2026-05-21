@@ -23,6 +23,20 @@ PROCESS_DIR = PROJECT_ROOT / "output" / "process"
 
 WHITE_INDEX = 18
 USE_METADATA_RGB_XYZ_BASELINE = True
+
+# Minimum exposure of the ColorChecker white patch, as a fraction of sensor
+# full scale (brightest channel). The white patch is the brightest neutral
+# training sample, so it bounds the tonal range the HPPCC/RPCC model is fitted
+# on. Below this level the model only learns the shadows; analyze warns and
+# the per-pixel linear fallback (below) carries the out-of-range tones.
+MIN_WHITE_PATCH_LEVEL = 0.25
+
+# Out-of-training-range fallback. HPPCC/RPCC extrapolate badly above the
+# brightest fitted patch value; the white-preserving linear matrix degrades
+# gracefully. Per pixel the output ramps from HPPCC/RPCC to the linear
+# baseline between `train_max` and `train_max * LINEAR_FALLBACK_RANGE_FACTOR`.
+LINEAR_FALLBACK_RANGE_FACTOR = 2.0
+
 CHROMATIC_INDICES = np.arange(18)
 HPPCC_REGION_CANDIDATES = [3, 4]
 USE_HPPCC_BLENDING = True

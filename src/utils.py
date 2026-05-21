@@ -1047,6 +1047,39 @@ def predict_hppcc_rpcc(
     return model.predict(rgb)
 
 
+def blend_model_with_linear_fallback(
+    model_xyz: np.ndarray,
+    linear_xyz: np.ndarray,
+    sensor_rgb: np.ndarray,
+    train_max: float,
+    *,
+    full_fallback_factor: float = 2.0,
+) -> np.ndarray:
+    """Fade a HPPCC/RPCC prediction to the linear baseline outside the fit range.
+
+    HPPCC's per-hue piecewise matrices and the RPCC polynomial residual are
+    fitted on patch values within ``[0, train_max]`` and extrapolate
+    catastrophically above it — large cyan/magenta casts across the highlights,
+    badly so when the calibration chart was under-exposed. The white-preserving
+    linear matrix (`LinearWhitePreservingModel`) degrades gracefully: it keeps
+    neutrals neutral and merely drives out-of-gamut brights toward white.
+
+    Per pixel the weight ramps from 0 at ``train_max`` (model fully trusted) to
+    1 at ``train_max * full_fallback_factor`` (pure linear), keyed on the
+    brightest input channel. It reaches exactly 1 — not asymptotically — so a
+    clearly out-of-range pixel discards the wild HPPCC value entirely. A
+    well-exposed chart has a high ``train_max``, so the fallback engages only
+    near clipping; an under-exposed one falls back across most of the frame.
+    """
+    model_xyz = np.asarray(model_xyz, dtype=np.float64)
+    linear_xyz = np.asarray(linear_xyz, dtype=np.float64)
+    max_channel = np.max(np.asarray(sensor_rgb, dtype=np.float64), axis=-1, keepdims=True)
+    lo = max(float(train_max), 1e-6)
+    hi = lo * max(float(full_fallback_factor), 1.0 + 1e-6)
+    weight = np.clip((max_channel - lo) / (hi - lo), 0.0, 1.0)
+    return model_xyz * (1.0 - weight) + linear_xyz * weight
+
+
 
 def hppcc_rpcc_model_to_dict(model: HPPCCRPCCModel) -> dict[str, object]:
     return {
