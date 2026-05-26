@@ -60,10 +60,11 @@ class HPPCCModel:
     white_rgb: np.ndarray
     white_xyz: np.ndarray
 
-    def predict(self, rgb: np.ndarray) -> np.ndarray:
+    def predict(self, rgb: np.ndarray, *, hue_rgb: np.ndarray | None = None) -> np.ndarray:
         rgb = np.asarray(rgb, dtype=np.float64)
         flat = rgb.reshape(-1, 3)
-        angles = hue_angle_from_rgb(flat)
+        hue_flat = np.asarray(hue_rgb, dtype=np.float64).reshape(-1, 3) if hue_rgb is not None else flat
+        angles = hue_angle_from_rgb(hue_flat)
         region_indices = np.searchsorted(self.boundaries, angles, side="right") % len(self.boundaries)
         out = np.empty_like(flat)
         for region in range(len(self.boundaries)):
@@ -72,10 +73,11 @@ class HPPCCModel:
                 out[mask] = flat[mask] @ self.matrices[region]
         return out.reshape(rgb.shape)
 
-    def predict_blending(self, rgb: np.ndarray, blend_width: float = 0.15) -> np.ndarray:
+    def predict_blending(self, rgb: np.ndarray, blend_width: float = 0.15, *, hue_rgb: np.ndarray | None = None) -> np.ndarray:
         rgb = np.asarray(rgb, dtype=np.float64)
         flat = rgb.reshape(-1, 3)
-        angles = hue_angle_from_rgb(flat)
+        hue_flat = np.asarray(hue_rgb, dtype=np.float64).reshape(-1, 3) if hue_rgb is not None else flat
+        angles = hue_angle_from_rgb(hue_flat)
         boundaries = np.asarray(self.boundaries, dtype=np.float64)
         k_regions = len(boundaries)
         if k_regions < 2:
@@ -202,16 +204,24 @@ def _fit_hppcc_constrained(
     b[-1] = white_xyz
 
     if lam > 0.0 and k_regions >= 2:
-        # Couple adjacent regions: extra least-squares rows whose residual is
-        # sqrt(lam) * (M_r - M_{r+1}), targeting zero. Each row block r spans
-        # the matrix blocks of regions r and (r+1) mod K.
-        root_lam = np.sqrt(float(lam))
+        # Couple adjacent regions with a per-pair penalty weight that is
+        # inversely proportional to the smaller region's patch count.
+        # A region with few patches is over-fitted and its matrix diverges
+        # easily; scaling its coupling weight by mean_count / min_count pulls
+        # it much more strongly toward its neighbour than the reverse.
+        # `lam` is calibrated for an "average-sized" region: a pair where
+        # min_count == mean_count gets exactly root_lam; pairs with a smaller
+        # region get proportionally more.
+        counts = np.bincount(region_ids, minlength=k_regions).astype(np.float64)
+        mean_count = counts.mean()
         penalty = np.zeros((3 * k_regions, 3 * k_regions), dtype=np.float64)
         for region in range(k_regions):
             next_region = (region + 1) % k_regions
+            min_count = min(counts[region], counts[next_region])
+            effective_root_lam = np.sqrt(float(lam) * mean_count / max(min_count, 1.0))
             rows = slice(3 * region, 3 * (region + 1))
-            penalty[rows, 3 * region : 3 * (region + 1)] = root_lam * np.eye(3)
-            penalty[rows, 3 * next_region : 3 * (next_region + 1)] = -root_lam * np.eye(3)
+            penalty[rows, 3 * region : 3 * (region + 1)] = effective_root_lam * np.eye(3)
+            penalty[rows, 3 * next_region : 3 * (next_region + 1)] = -effective_root_lam * np.eye(3)
         a = np.vstack([a, penalty])
         p_sorted = np.vstack([p_sorted, np.zeros((3 * k_regions, 3), dtype=np.float64)])
 
@@ -366,13 +376,13 @@ class HPPCCRPCCModel:
     def white_xyz(self) -> np.ndarray:
         return self.hppcc.white_xyz
 
-    def predict(self, rgb: np.ndarray) -> np.ndarray:
+    def predict(self, rgb: np.ndarray, *, hue_rgb: np.ndarray | None = None) -> np.ndarray:
         rgb = np.asarray(rgb, dtype=np.float64)
-        return self.hppcc.predict(rgb) + self.rpcc_residual.predict(rgb)
+        return self.hppcc.predict(rgb, hue_rgb=hue_rgb) + self.rpcc_residual.predict(rgb)
 
-    def predict_blending(self, rgb: np.ndarray, blend_width: float = 0.15) -> np.ndarray:
+    def predict_blending(self, rgb: np.ndarray, blend_width: float = 0.15, *, hue_rgb: np.ndarray | None = None) -> np.ndarray:
         rgb = np.asarray(rgb, dtype=np.float64)
-        return self.hppcc.predict_blending(rgb, blend_width=blend_width) + self.rpcc_residual.predict(rgb)
+        return self.hppcc.predict_blending(rgb, blend_width=blend_width, hue_rgb=hue_rgb) + self.rpcc_residual.predict(rgb)
 
 
 def _rpcc_features(rgb: np.ndarray) -> np.ndarray:

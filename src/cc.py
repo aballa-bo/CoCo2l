@@ -363,6 +363,7 @@ def run_analysis(args) -> None:
             detection.absolute_patch_centers,
             raw.daylight_whitebalance,
             reference_illuminant_white,
+            scene_width=detection.scene_image.shape[1],
         )
     print_neutral_gradient_report(CLASSIC_24_PATCH_NAMES, neutral_gradient_report)
 
@@ -687,6 +688,7 @@ def _process_single_raw(
     # from correction files written before v0.2.4 — default to the HPPCC path
     # and fall back to the white patch level, which bounds the training range.
     baseline_model = linear_model_from_dict(models_payload["baseline"])
+    neutral_gradient = diagnostics.get("neutral_gradient")
     if bool(settings.get("use_linear_only", False)):
         # Under-exposed chart: HPPCC/RPCC unreliable everywhere — linear only.
         corrected_full_xyz = baseline_model.predict(normalized_full_rgb)
@@ -694,12 +696,12 @@ def _process_single_raw(
         if use_nonlinear:
             model = hppcc_rpcc_model_from_dict(models_payload["hppcc_rpcc"])
             corrected_full_xyz = predict_hppcc_rpcc(
-                model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width
+                model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width,
             )
         else:
             model = hppcc_model_from_dict(models_payload["hppcc"])
             corrected_full_xyz = predict_hppcc(
-                model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width
+                model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width,
             )
         # Fade to the linear baseline above the fitted tonal range so
         # out-of-range highlights stay sane instead of casting.

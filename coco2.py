@@ -978,8 +978,10 @@ class AnalyzeTab(QWidget):
     # ── helpers ───────────────────────────────────────────────────────────
 
     def _browse_raw(self) -> None:
+        current = self._raw_edit.text().strip()
+        start_dir = str(Path(current).parent) if current and Path(current).exists() else ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select input image", "", _INPUT_FILE_FILTER,
+            self, "Select input image", start_dir, _INPUT_FILE_FILTER,
         )
         if path:
             if not self._output_dir.text().strip():

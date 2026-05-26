@@ -190,6 +190,7 @@ def analyze_neutral_illuminant_gradient(
     absolute_patch_centers: np.ndarray,
     daylight_wb: tuple,
     reference_white: np.ndarray,
+    scene_width: int | None = None,
 ) -> dict[str, object]:
     neutral_indices = np.asarray(neutral_indices, dtype=int)
     centers = np.asarray(absolute_patch_centers[neutral_indices], dtype=np.float64)
@@ -276,6 +277,7 @@ def analyze_neutral_illuminant_gradient(
         "severity": severity,
         "x_min": float(np.min(x_positions)),
         "x_max": float(np.max(x_positions)),
+        "scene_width": int(scene_width) if scene_width is not None else None,
         "horizontal_xy_span": horizontal_xy_span,
         "horizontal_cct_span": horizontal_cct_span,
         "r_over_g_span": float(np.max(r_over_g) - np.min(r_over_g)),
@@ -666,7 +668,7 @@ def apply_white_field_correction_to_patches(
     return rgb_patches * gain[:, None]
 
 
-def desaturate_highlights(rgb: np.ndarray, *, threshold: float = 0.93) -> np.ndarray:
+def desaturate_highlights(rgb: np.ndarray, *, threshold: float = 0.97) -> np.ndarray:
     # Above `threshold` we leave HPPCC's training range; the per-hue regions
     # extrapolate unreliably and demosaicing artefacts (false-color near
     # clipped pixels) push the hue toward magenta/green. Forcing channels
@@ -674,6 +676,8 @@ def desaturate_highlights(rgb: np.ndarray, *, threshold: float = 0.93) -> np.nda
     # specular highlights — at the cost of progressively flattening any
     # legitimate saturation above the threshold (sensor info there is
     # already partly lost to clipping anyway).
+    # NOTE: threshold must be above training_max_rgb (typically ~0.935) so
+    # bright-but-not-clipped chart patches are never desaturated mid-patch.
     rgb = np.asarray(rgb, dtype=np.float64)
     max_channel = np.max(rgb, axis=-1, keepdims=True)
     denom = max(1.0 - float(threshold), 1e-12)
@@ -684,7 +688,7 @@ def desaturate_highlights(rgb: np.ndarray, *, threshold: float = 0.93) -> np.nda
 def highlight_blowout_weight(
     sensor_rgb: np.ndarray,
     *,
-    threshold: float = 0.93,
+    threshold: float = 0.97,
     full: float = 0.99,
 ) -> np.ndarray:
     """Per-pixel weight in [0, 1] marking over-exposed (clipped) pixels.
@@ -1023,16 +1027,85 @@ def apply_matrix_transform(rgb: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return rgb @ matrix
 
 
+def compute_gradient_hue_rgb(
+    rgb: np.ndarray,
+    neutral_gradient: dict | None,
+    image_width: int,
+) -> np.ndarray:
+    """Return gradient-corrected RGB for use in HPPCC hue-angle computation only.
+
+    Normalises R/G and B/G per pixel column to their chart-centre values using
+    the horizontal illumination gradient fitted during analysis.  The result
+    should be passed as ``hue_rgb`` to ``predict_hppcc`` / ``predict_hppcc_rpcc``
+    so that region assignment is stable across the frame; the actual matrix
+    multiplication still operates on the original (uncorrected) RGB values.
+
+    If the gradient is absent or ``scene_width`` was not recorded (older JSON)
+    the function returns ``rgb`` unchanged.
+    """
+    if neutral_gradient is None or not neutral_gradient.get("supports_horizontal_test", False):
+        return rgb
+    scene_width = neutral_gradient.get("scene_width")
+    if scene_width is None or scene_width <= 0:
+        return rgb
+
+    wl = neutral_gradient.get("weighted_line", {})
+    rg_line = wl.get("r_over_g")
+    bg_line = wl.get("b_over_g")
+    if rg_line is None or bg_line is None:
+        return rgb
+
+    x_min = float(neutral_gradient["x_min"])
+    x_max = float(neutral_gradient["x_max"])
+    span_scene = x_max - x_min
+    if span_scene <= 0:
+        return rgb
+
+    rg_intercept = float(rg_line["intercept"])
+    rg_slope = float(rg_line["slope"])
+    bg_intercept = float(bg_line["intercept"])
+    bg_slope = float(bg_line["slope"])
+
+    # Reference chromaticity at the centre of the gradient span (x_norm = 0.5).
+    rg_ref = rg_intercept + rg_slope * 0.5
+    bg_ref = bg_intercept + bg_slope * 0.5
+
+    # Map each pixel column in the current image to gradient x_norm.
+    scale = float(scene_width) / float(image_width)
+    cols = np.arange(image_width, dtype=np.float64)
+    x_norm = (cols * scale - x_min) / span_scene  # shape (W,)
+
+    rg_local = rg_intercept + rg_slope * x_norm
+    bg_local = bg_intercept + bg_slope * x_norm
+    rg_local = np.maximum(rg_local, 1e-6)
+    bg_local = np.maximum(bg_local, 1e-6)
+
+    r_scale = rg_ref / rg_local  # shape (W,)
+    b_scale = bg_ref / bg_local  # shape (W,)
+
+    rgb = np.asarray(rgb, dtype=np.float64)
+    original_shape = rgb.shape
+    if rgb.ndim == 3:
+        H, W, _ = rgb.shape
+        result = rgb.copy()
+        result[:, :, 0] *= r_scale[np.newaxis, :]
+        result[:, :, 2] *= b_scale[np.newaxis, :]
+        return result
+    # Flat patch array (N, 3) — no spatial info, return unchanged.
+    return rgb
+
+
 def predict_hppcc(
     hppcc_model,
     rgb: np.ndarray,
     *,
     use_blending: bool,
     blend_width: float,
+    hue_rgb: np.ndarray | None = None,
 ) -> np.ndarray:
     if use_blending:
-        return hppcc_model.predict_blending(rgb, blend_width=blend_width)
-    return hppcc_model.predict(rgb)
+        return hppcc_model.predict_blending(rgb, blend_width=blend_width, hue_rgb=hue_rgb)
+    return hppcc_model.predict(rgb, hue_rgb=hue_rgb)
 
 
 def predict_hppcc_rpcc(
@@ -1041,10 +1114,11 @@ def predict_hppcc_rpcc(
     *,
     use_blending: bool,
     blend_width: float,
+    hue_rgb: np.ndarray | None = None,
 ) -> np.ndarray:
     if use_blending:
-        return model.predict_blending(rgb, blend_width=blend_width)
-    return model.predict(rgb)
+        return model.predict_blending(rgb, blend_width=blend_width, hue_rgb=hue_rgb)
+    return model.predict(rgb, hue_rgb=hue_rgb)
 
 
 def blend_model_with_linear_fallback(
@@ -1190,7 +1264,8 @@ def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
     try:
         argfile.write("\n".join(argfile_lines) + "\n")
         argfile.close()
-        command = [_resolve_exiftool(), "-@", argfile.name]
+        exe = _resolve_exiftool()
+        command = [exe, "-@", argfile.name]
 
         # Retry transient failures: AV/OneDrive/file-locking can briefly steal
         # the file right after we wrote it, and exiftool exits with code -1
@@ -1200,9 +1275,15 @@ def copy_exif_from_raw(source_raw_path: Path, target_image_path: Path) -> None:
         last_stderr = b""
         last_stdout = b""
         for attempt in range(3):
-            completed = subprocess.run(
-                command, check=False, capture_output=True, creationflags=creationflags,
-            )
+            try:
+                completed = subprocess.run(
+                    command, check=False, capture_output=True, creationflags=creationflags,
+                )
+            except FileNotFoundError:
+                raise RuntimeError(
+                    f"exiftool not found (tried: {exe!r}). Install exiftool and place it "
+                    f"next to coco2.exe, or set [paths] exiftool in config.ini."
+                )
             if completed.returncode == 0:
                 return
             last_returncode = completed.returncode
