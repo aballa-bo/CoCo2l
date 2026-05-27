@@ -1,6 +1,6 @@
 """Scientific core for hue-plane preserving color correction."""
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 from .colorchecker import (
     CLASSIC_24_CHROMATIC_NAMES,
@@ -9,11 +9,13 @@ from .colorchecker import (
 )
 from .metrics import delta_e_2000, hue_angle_from_rgb, lab_to_xyz, xyy_to_xyz, xyz_to_lab
 from .models import (
+    HPPCCGradientModel,
     HPPCCModel,
     HPPCCRPCCModel,
     LinearWhitePreservingModel,
     RPCCModel,
     fit_hppcc,
+    fit_hppcc_gradient,
     fit_hppcc_rpcc,
     fit_rpcc,
     fit_white_preserving_3x3,
@@ -33,6 +35,7 @@ __all__ = [
     "CLASSIC_24_CHROMATIC_NAMES",
     "CLASSIC_24_NEUTRAL_NAMES",
     "CLASSIC_24_PATCH_NAMES",
+    "HPPCCGradientModel",
     "HPPCCModel",
     "HPPCCRPCCModel",
     "LinearWhitePreservingModel",
@@ -43,6 +46,7 @@ __all__ = [
     "RawLinearImage",
     "delta_e_2000",
     "fit_hppcc",
+    "fit_hppcc_gradient",
     "fit_hppcc_rpcc",
     "fit_rpcc",
     "fit_white_preserving_3x3",

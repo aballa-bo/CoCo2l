@@ -15,6 +15,8 @@ from src.config import (
     ENABLE_PATCH_VARIANCE_DENOISE,
     ENABLE_PROCESS_WHITE_FIELD,
     HPPCC_BLEND_WIDTH,
+    HPPCC_GRADIENT,
+    HPPCC_GRADIENT_HARMONICS,
     HPPCC_REGION_CANDIDATES,
     HPPCC_REGION_SMOOTHNESS,
     IMAGE_DIR,
@@ -31,6 +33,7 @@ from src.config import (
     SHARPEN_THRESHOLD,
     SHOW_DETECTION_PREVIEW,
     SHOW_DEVELOPED_IMAGE_PREVIEW,
+    SIMPLE_LINEAR,
     STANDARD_WHITES,
     USE_HPPCC_BLENDING,
     USE_METADATA_RGB_XYZ_BASELINE,
@@ -206,6 +209,24 @@ def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defau
         action=argparse.BooleanOptionalAction,
         default=PERFORM_NONLINEAR_CORRECTIONS if use_defaults else None,
         help="If set, fits HPPCC+RPCC (nonlinear residual). Otherwise, uses HPPCC only.",
+    )
+    parser.add_argument(
+        "--simple-linear",
+        action=argparse.BooleanOptionalAction,
+        default=SIMPLE_LINEAR if use_defaults else None,
+        help="Use only the white-preserving 3x3 linear model, skipping HPPCC entirely.",
+    )
+    parser.add_argument(
+        "--hppcc-gradient",
+        action=argparse.BooleanOptionalAction,
+        default=HPPCC_GRADIENT if use_defaults else None,
+        help="Fit a trigonometric-series HPPCC instead of the piecewise-constrained model.",
+    )
+    parser.add_argument(
+        "--hppcc-gradient-harmonics",
+        type=int,
+        default=HPPCC_GRADIENT_HARMONICS if use_defaults else None,
+        help="Number of Fourier harmonics for the gradient HPPCC (default: 2).",
     )
     parser.add_argument(
         "--show-detection-preview",

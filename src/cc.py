@@ -61,6 +61,7 @@ from src.report import (
     print_detection_summary,
     print_hppcc_candidate_report,
     print_chroma_report,
+    print_hppcc_gradient_contribution_report,
     print_hppcc_region_report,
     print_metadata_matrix_report,
     print_neutral_gradient_report,
@@ -70,18 +71,22 @@ from src.report import (
     print_patch_correction_report,
     print_patch_delta_e_report,
     print_scene_white_report,
+    save_analysis_text_report,
     save_detection_overlay_preview,
     save_named_corrected_image,
     save_json_grid_preview,
     show_corrected_image,
 )
 from src.utils import (
+    _D50_WHITE,
+    _D65_WHITE,
     apply_matrix_transform,
     blend_model_with_linear_fallback,
     apply_white_field_correction,
     apply_white_field_correction_to_patches,
     analyze_neutral_illuminant_gradient,
     bradford_adapt_xyz,
+    bradford_adapt_matrix,
     compute_white_field_falloff,
     copy_exif_from_raw,
     denoise_linear_rgb,
@@ -145,6 +150,9 @@ PROCESS_SETTING_NAMES = (
     "use_hppcc_blending",
     "hppcc_blend_width",
     "perform_nonlinear_corrections",
+    "simple_linear",
+    "hppcc_gradient",
+    "hppcc_gradient_harmonics",
     "show_detection_preview",
     "show_developed_image_preview",
     "output_format",
@@ -190,6 +198,7 @@ def run_analysis(args) -> None:
     sensor_black_levels_rgb = reduce_cfa_values_to_rgb(raw.black_level_per_channel, raw.color_desc)
     sensor_white_levels_rgb = reduce_cfa_values_to_rgb(raw.camera_white_level_per_channel, raw.color_desc)
     metadata_rgb_xyz_matrix = reduce_cfa_matrix_to_rgb(raw.rgb_xyz_matrix, raw.color_desc)
+    metadata_rgb_xyz_illuminant = getattr(raw, "rgb_xyz_illuminant", None)
     if sensor_black_levels_rgb is None or sensor_white_levels_rgb is None:
         raise RuntimeError("Missing sensor black/white metadata required for radiometric normalization.")
 
@@ -369,8 +378,17 @@ def run_analysis(args) -> None:
 
     save_json_grid_preview(args.analysis_dir, make_json_grid_preview, corrected_rgb)
 
+    use_hppcc_gradient = bool(getattr(args, "hppcc_gradient", False))
+    use_simple_linear = bool(getattr(args, "simple_linear", False))
+    gradient_harmonics = int(getattr(args, "hppcc_gradient_harmonics", 2))
+    # Gradient model is region-independent: iterate candidates only for constrained HPPCC.
+    candidates_to_try = (
+        [int(np.asarray(args.hppcc_region_candidates, dtype=int)[0])]
+        if use_hppcc_gradient
+        else list(np.asarray(args.hppcc_region_candidates, dtype=int))
+    )
     hppcc_candidate_results = []
-    for k_regions in np.asarray(args.hppcc_region_candidates, dtype=int):
+    for k_regions in candidates_to_try:
         result = summarize_model(
             src,
             corrected_rgb,
@@ -386,6 +404,8 @@ def run_analysis(args) -> None:
             perform_nonlinear_corrections=args.perform_nonlinear_corrections,
             reference_chroma=reference_chroma,
             reliable_patch_indices=reliable_patch_indices,
+            use_hppcc_gradient=use_hppcc_gradient,
+            hppcc_gradient_harmonics=gradient_harmonics,
         )
         hppcc_candidate_results.append({"k": int(k_regions), "best": result})
 
@@ -400,9 +420,25 @@ def run_analysis(args) -> None:
     selected_k_regions = int(selected_candidate["k"])
 
     if args.use_metadata_rgb_xyz_baseline and metadata_rgb_xyz_matrix is not None:
-        metadata_xyz = apply_matrix_transform(corrected_rgb, metadata_rgb_xyz_matrix)
+        _meta_illuminant = metadata_rgb_xyz_illuminant if metadata_rgb_xyz_illuminant is not None else _D65_WHITE
+        _adapt_m = bradford_adapt_matrix(_meta_illuminant, scene_white_xyz)
+        adapted_meta_matrix = metadata_rgb_xyz_matrix @ _adapt_m.T
+        metadata_xyz = apply_matrix_transform(corrected_rgb, adapted_meta_matrix)
         metadata_de00 = delta_e00_summary(src, metadata_xyz, adapted_reference_xyz, scene_white_xyz)
         print_metadata_matrix_report("Metadata rgb_xyz_matrix", metadata_de00)
+        # When the chart is underexposed the fitted baseline is numerically unstable
+        # (trained on shadow data only). The factory-calibrated metadata matrix is
+        # more reliable in that regime. If it gives a lower mean ΔE, promote it to
+        # the baseline so both the analysis image and the saved JSON benefit.
+        if chart_underexposed and np.mean(metadata_de00) < np.mean(best["baseline_de00"]):
+            adapted_meta_baseline = src.LinearWhitePreservingModel(
+                matrix=adapted_meta_matrix,
+                white_rgb=corrected_rgb[int(args.white_index)],
+                white_xyz=adapted_reference_xyz[int(args.white_index)],
+            )
+            best["baseline"] = adapted_meta_baseline
+            best["baseline_de00"] = metadata_de00
+            print("  -> Using adapted metadata matrix as baseline (lower ΔE than fitted model).")
 
     normalized_full_rgb = normalize_with_sensor_levels(
         raw.rgb,
@@ -430,7 +466,10 @@ def run_analysis(args) -> None:
             radius=float(args.sharpen_radius),
             threshold=float(args.sharpen_threshold),
         )
-    if args.perform_nonlinear_corrections:
+    if use_simple_linear:
+        corrected_full_xyz = best["baseline"].predict(normalized_full_rgb)
+        output_label = "baseline"
+    elif args.perform_nonlinear_corrections:
         corrected_full_xyz = predict_hppcc_rpcc(
             best["hppcc_rpcc"],
             normalized_full_rgb,
@@ -514,6 +553,9 @@ def run_analysis(args) -> None:
                 "hppcc_blend_width": float(args.hppcc_blend_width),
                 "hppcc_region_smoothness": float(args.hppcc_region_smoothness),
                 "perform_nonlinear_corrections": bool(args.perform_nonlinear_corrections),
+                "simple_linear": bool(use_simple_linear),
+                "hppcc_gradient": bool(use_hppcc_gradient),
+                "hppcc_gradient_harmonics": int(gradient_harmonics),
                 "output_format": args.output_format,
                 "output_colorspace": args.output_colorspace,
                 "undistort": undistort_info if undistort_info is not None
@@ -537,39 +579,89 @@ def run_analysis(args) -> None:
         detection,
         corrected_rgb,
     )
-    primary_model = best["hppcc_rpcc"] if args.perform_nonlinear_corrections else best["hppcc"]
+    primary_model = (
+        best["hppcc"] if use_simple_linear
+        else best["hppcc_rpcc"] if args.perform_nonlinear_corrections
+        else best["hppcc"]
+    )
+    _hppcc_label = "hppcc_gradient" if use_hppcc_gradient else "hppcc"
+    _linear_only = use_simple_linear or chart_underexposed
     print_model_report(
         best,
         selected_k_regions,
         perform_nonlinear_corrections=args.perform_nonlinear_corrections,
         use_hppcc_blending=args.use_hppcc_blending,
         hppcc_blend_width=args.hppcc_blend_width,
+        use_simple_linear=use_simple_linear,
+        chart_underexposed=chart_underexposed,
+        use_hppcc_gradient=use_hppcc_gradient,
     )
-    hppcc_region_indices = np.searchsorted(
-        primary_model.boundaries,
-        src.hue_angle_from_rgb(corrected_rgb),
-        side="right",
-    ) % len(primary_model.boundaries)
-    print_hppcc_region_report(
-        CLASSIC_24_PATCH_NAMES,
-        primary_model.boundaries,
-        hppcc_region_indices,
-        np.asarray(args.chromatic_indices, dtype=int),
-    )
+    _gradient_model = None
+    if isinstance(primary_model, src.HPPCCGradientModel):
+        _gradient_model = primary_model
+    elif isinstance(primary_model, src.HPPCCRPCCModel) and isinstance(primary_model.hppcc, src.HPPCCGradientModel):
+        _gradient_model = primary_model.hppcc
+    if not _linear_only:
+        if _gradient_model is not None:
+            print_hppcc_gradient_contribution_report(
+                CLASSIC_24_PATCH_NAMES,
+                _gradient_model,
+                corrected_rgb,
+                np.asarray(args.chromatic_indices, dtype=int),
+            )
+        else:
+            hppcc_region_indices = np.searchsorted(
+                primary_model.boundaries,
+                src.hue_angle_from_rgb(corrected_rgb),
+                side="right",
+            ) % len(primary_model.boundaries)
+            print_hppcc_region_report(
+                CLASSIC_24_PATCH_NAMES,
+                primary_model.boundaries,
+                hppcc_region_indices,
+                np.asarray(args.chromatic_indices, dtype=int),
+            )
     print_patch_delta_e_report(
         CLASSIC_24_PATCH_NAMES,
         best["baseline_de00"],
-        best["rpcc_de00"],
-        best["hppcc_de00"],
-        best.get("hppcc_rpcc_de00"),
+        hppcc_de00=None if _linear_only else best["hppcc_de00"],
+        hppcc_rpcc_de00=None if _linear_only else best.get("hppcc_rpcc_de00"),
+        hppcc_label=_hppcc_label,
     )
     print_chroma_report(
         CLASSIC_24_PATCH_NAMES,
         best["baseline_chroma_error"],
-        best["rpcc_chroma_error"],
-        best["hppcc_chroma_error"],
-        best.get("hppcc_rpcc_chroma_error"),
+        hppcc_chroma_error=None if _linear_only else best.get("hppcc_chroma_error"),
+        hppcc_rpcc_chroma_error=None if _linear_only else best.get("hppcc_rpcc_chroma_error"),
+        hppcc_label=_hppcc_label,
     )
+    report_txt_path = args.analysis_dir / f"{raw_path.stem}_report.txt"
+    save_analysis_text_report(
+        report_txt_path,
+        app_version=src.__version__,
+        raw_path=raw_path,
+        analysis_image_path=analysis_output_path,
+        result_json_path=result_json_path,
+        patch_names=CLASSIC_24_PATCH_NAMES,
+        reference_illuminant=args.reference_illuminant,
+        scene_white_source=scene_white_source,
+        scene_white_xyz=scene_white_xyz,
+        native_reference_white=native_reference_white,
+        white_patch_level=white_patch_level,
+        chart_underexposed=chart_underexposed,
+        training_max_rgb=training_max_rgb,
+        use_simple_linear=use_simple_linear,
+        use_hppcc_gradient=use_hppcc_gradient,
+        perform_nonlinear_corrections=args.perform_nonlinear_corrections,
+        selected_k_regions=selected_k_regions,
+        output_label=output_label,
+        neutral_gradient=neutral_gradient_report,
+        best=best,
+        hppcc_label=_hppcc_label,
+        linear_only=_linear_only,
+        chromatic_indices=np.asarray(args.chromatic_indices, dtype=int),
+    )
+    print(f"Analysis report written to: {report_txt_path}")
     if args.show_developed_image_preview:
         show_corrected_image(corrected_full_uint8)
 
@@ -689,8 +781,9 @@ def _process_single_raw(
     # and fall back to the white patch level, which bounds the training range.
     baseline_model = linear_model_from_dict(models_payload["baseline"])
     neutral_gradient = diagnostics.get("neutral_gradient")
-    if bool(settings.get("use_linear_only", False)):
-        # Under-exposed chart: HPPCC/RPCC unreliable everywhere — linear only.
+    use_simple_linear_proc = bool(settings.get("simple_linear", False))
+    if bool(settings.get("use_linear_only", False)) or use_simple_linear_proc:
+        # Under-exposed chart or explicit simple-linear mode: baseline only.
         corrected_full_xyz = baseline_model.predict(normalized_full_rgb)
     else:
         if use_nonlinear:

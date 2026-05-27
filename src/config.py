@@ -38,6 +38,14 @@ MIN_WHITE_PATCH_LEVEL = 0.25
 # Higher = adjacent matrices kept closer (smoother images) at a small cost in
 # chart accuracy; 0 disables it. Exposed in the GUI via HPPCC > HPPCC settings.
 HPPCC_REGION_SMOOTHNESS = 0.0
+HPPCC_GRADIENT = False
+HPPCC_GRADIENT_HARMONICS = 2
+# Spatial Gaussian sigma (pixels) applied to the rg-chromaticity maps before
+# computing hue angles in HPPCCGradientModel.predict() for full images.
+# Suppresses per-pixel shot-noise in the hue angle (σ_θ ≈ σ_noise/ρ), which
+# is otherwise amplified for low-saturation hues like yellow and causes grain.
+# Set to 0 to disable. Has no effect on patch-mean predictions (N×3 inputs).
+HPPCC_GRADIENT_SMOOTH_SIGMA = 2.0
 
 # Out-of-training-range fallback. HPPCC/RPCC extrapolate badly above the
 # brightest fitted patch value; the white-preserving linear matrix degrades
@@ -63,6 +71,7 @@ SHARPEN_RADIUS = 1.0
 SHARPEN_THRESHOLD = 1.5
 ENABLE_PROCESS_WHITE_FIELD = False
 PERFORM_NONLINEAR_CORRECTIONS = True
+SIMPLE_LINEAR = False
 SHOW_DETECTION_PREVIEW = False
 SHOW_DEVELOPED_IMAGE_PREVIEW = False
 OUTPUT_FORMAT = "jpeg"

@@ -7,7 +7,7 @@ from itertools import combinations
 
 import numpy as np
 
-from .config import HPPCC_REGION_SMOOTHNESS
+from .config import HPPCC_GRADIENT_SMOOTH_SIGMA, HPPCC_REGION_SMOOTHNESS
 from .metrics import hue_angle_from_rgb
 
 
@@ -348,6 +348,56 @@ def fit_hppcc(
 
 
 @dataclass(frozen=True)
+class HPPCCGradientModel:
+    """Hue-gradient HPPCC: M(θ) = Σ_k [A_k·cos(kθ) + B_k·sin(kθ)], smooth for all θ.
+
+    The correction matrix varies continuously with hue angle via a truncated Fourier
+    series. White-point preservation is enforced for every basis function, so
+    M(θ)·white_rgb = white_xyz holds identically for all θ.
+    coeffs has shape (1 + 2·n_harmonics, 3, 3): [A₀, A₁, B₁, A₂, B₂, ...].
+    """
+
+    coeffs: np.ndarray
+    white_rgb: np.ndarray
+    white_xyz: np.ndarray
+
+    def _basis(self, angles: np.ndarray) -> np.ndarray:
+        n = (self.coeffs.shape[0] - 1) // 2
+        parts = [np.ones(len(angles), dtype=np.float64)]
+        for k in range(1, n + 1):
+            parts.append(np.cos(k * angles))
+            parts.append(np.sin(k * angles))
+        return np.stack(parts, axis=1)  # (N, 1+2n)
+
+    def predict(self, rgb: np.ndarray, *, smooth_sigma: float = HPPCC_GRADIENT_SMOOTH_SIGMA, **_kwargs) -> np.ndarray:
+        rgb = np.asarray(rgb, dtype=np.float64)
+        flat = rgb.reshape(-1, 3)
+        if rgb.ndim == 3 and smooth_sigma > 0:
+            from scipy.ndimage import gaussian_filter
+            h, w = rgb.shape[:2]
+            denom = flat.sum(axis=-1).clip(1e-12).reshape(h, w)
+            r_norm = gaussian_filter(flat[:, 0].reshape(h, w) / denom, sigma=smooth_sigma)
+            g_norm = gaussian_filter(flat[:, 1].reshape(h, w) / denom, sigma=smooth_sigma)
+            angles = np.mod(np.arctan2(g_norm - 1.0 / 3.0, r_norm - 1.0 / 3.0).ravel(), 2.0 * np.pi)
+        else:
+            angles = hue_angle_from_rgb(flat)
+        basis = self._basis(angles)
+        out = np.einsum("ik,il,klj->ij", basis, flat, self.coeffs)
+        return out.reshape(rgb.shape)
+
+    def predict_blending(self, rgb: np.ndarray, blend_width: float = 0.15, **_kwargs) -> np.ndarray:
+        return self.predict(rgb)
+
+    @property
+    def boundaries(self) -> np.ndarray:
+        return np.array([0.0])
+
+    @property
+    def matrices(self) -> np.ndarray:
+        return self.coeffs
+
+
+@dataclass(frozen=True)
 class HPPCCRPCCModel:
     """Two-stage pipeline: HPPCC hue-preserving primary + RPCC global residual correction.
 
@@ -355,6 +405,7 @@ class HPPCCRPCCModel:
     The RPCC component is trained on xyz residuals (xyz_ref - xyz_hppcc).
     Because HPPCC preserves the white point exactly, the RPCC residual for the white
     patch is zero and its white-point constraint is trivially satisfied.
+    hppcc accepts both HPPCCModel and HPPCCGradientModel (duck typing).
     """
 
     hppcc: HPPCCModel
@@ -460,3 +511,51 @@ def fit_hppcc_rpcc(
     xyz_residual = xyz - xyz_hppcc
     rpcc_residual = fit_rpcc(rgb, xyz_residual, white_index=white_index)
     return HPPCCRPCCModel(hppcc=hppcc, rpcc_residual=rpcc_residual)
+
+
+def fit_hppcc_gradient(
+    rgb: np.ndarray,
+    xyz: np.ndarray,
+    *,
+    white_index: int,
+    chromatic_indices: np.ndarray | list[int],
+    n_harmonics: int = 2,
+) -> HPPCCGradientModel:
+    """Fit a trigonometric-series HPPCC: M(θ) varies smoothly with hue angle.
+
+    White-point preservation is enforced for every basis function (A_k·white = 0 for k≥1,
+    A_0·white = white_xyz), so M(θ)·white_rgb = white_xyz holds for all θ.
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    chromatic_indices = np.asarray(chromatic_indices, dtype=int)
+    q = rgb[chromatic_indices]
+    p = xyz[chromatic_indices]
+    white_rgb = rgb[white_index]
+    white_xyz = xyz[white_index]
+
+    angles = hue_angle_from_rgb(q)
+    n_basis = 1 + 2 * n_harmonics
+
+    parts: list[np.ndarray] = [np.ones(len(angles), dtype=np.float64)]
+    for k in range(1, n_harmonics + 1):
+        parts.append(np.cos(k * angles))
+        parts.append(np.sin(k * angles))
+    basis = np.stack(parts, axis=1)  # (N, n_basis)
+
+    # Design matrix: X[i, k*3+l] = basis[i,k] * q[i,l]
+    x = (basis[:, :, np.newaxis] * q[:, np.newaxis, :]).reshape(len(q), -1)
+
+    # White constraints per basis function: A_k · white_rgb = white_xyz (k=0), 0 (k≥1)
+    c = np.zeros((n_basis, n_basis * 3), dtype=np.float64)
+    b = np.zeros((n_basis, 3), dtype=np.float64)
+    for k in range(n_basis):
+        c[k, k * 3:(k + 1) * 3] = white_rgb
+    b[0] = white_xyz
+
+    w = _solve_constrained_least_squares(x, p, c, b)  # (n_basis*3, 3)
+    return HPPCCGradientModel(
+        coeffs=w.reshape(n_basis, 3, 3),
+        white_rgb=white_rgb.copy(),
+        white_xyz=white_xyz.copy(),
+    )
