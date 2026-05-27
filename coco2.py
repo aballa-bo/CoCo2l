@@ -937,9 +937,18 @@ class AnalyzeTab(QWidget):
         self._cs = QComboBox(); self._cs.addItems(["sRGB", "Display-P3"])
         opts.addWidget(self._cs)
         opts.addSpacing(20)
-        self._nonlinear = QCheckBox("Nonlinear corrections (HPPCC+RPCC)")
+        self._simple_linear = QCheckBox("Simple linear")
+        self._simple_linear.setChecked(False)
+        self._simple_linear.toggled.connect(self._on_simple_linear_toggled)
+        opts.addWidget(self._simple_linear)
+        opts.addSpacing(8)
+        self._nonlinear = QCheckBox("Non linear corrections")
         self._nonlinear.setChecked(True)   # mirrors PERFORM_NONLINEAR_CORRECTIONS default
         opts.addWidget(self._nonlinear)
+        opts.addSpacing(8)
+        self._hppcc_gradient = QCheckBox("HPPCC gradient")
+        self._hppcc_gradient.setChecked(False)
+        opts.addWidget(self._hppcc_gradient)
         opts.addSpacing(12)
         self._denoise = QCheckBox("Patch variance denoise")
         self._denoise.setChecked(False)    # mirrors ENABLE_PATCH_VARIANCE_DENOISE default
@@ -1036,6 +1045,10 @@ class AnalyzeTab(QWidget):
         if d:
             edit.setText(d)
 
+    def _on_simple_linear_toggled(self, checked: bool) -> None:
+        self._nonlinear.setEnabled(not checked)
+        self._hppcc_gradient.setEnabled(not checked)
+
     def _on_white_field_toggled(self, checked: bool) -> None:
         self._white_field_path.setEnabled(checked)
         self._white_field_browse.setEnabled(checked)
@@ -1087,10 +1100,12 @@ class AnalyzeTab(QWidget):
             "--no-show-detection-preview",
             "--no-show-developed-image-preview",
         )
-        if self._nonlinear.isChecked():
-            args.append("--perform-nonlinear-corrections")
+        if self._simple_linear.isChecked():
+            args += ["--simple-linear", "--no-perform-nonlinear-corrections"]
+        elif self._nonlinear.isChecked():
+            args += ["--no-simple-linear", "--perform-nonlinear-corrections"]
         else:
-            args.append("--no-perform-nonlinear-corrections")
+            args += ["--no-simple-linear", "--no-perform-nonlinear-corrections"]
         args += self.denoise_args_provider()
         args += self.sharpen_args_provider()
         args += self.hppcc_args_provider()
@@ -1929,7 +1944,9 @@ class MainWindow(QMainWindow):
             "analyze.show_developed": a._show_developed,
             "analyze.format":         a._fmt,
             "analyze.colorspace":     a._cs,
+            "analyze.simple_linear":  a._simple_linear,
             "analyze.nonlinear":      a._nonlinear,
+            "analyze.hppcc_gradient": a._hppcc_gradient,
             "analyze.denoise":        a._denoise,
             "analyze.sharpen":        a._sharpen,
             "analyze.white_field":    a._white_field,
@@ -2123,6 +2140,10 @@ class MainWindow(QMainWindow):
             ]
         else:
             args += ["--no-use-hppcc-blending"]
+        if self._analyze._hppcc_gradient.isChecked():
+            args.append("--hppcc-gradient")
+        else:
+            args.append("--no-hppcc-gradient")
         return args
 
     # ── slots ─────────────────────────────────────────────────────────────

@@ -8,8 +8,8 @@ import cv2
 import numpy as np
 from PIL import ImageCms
 
-from .config import HPPCC_REGION_SMOOTHNESS, PROJECT_ROOT
-from .models import HPPCCModel, HPPCCRPCCModel, LinearWhitePreservingModel, RPCCModel
+from .config import HPPCC_GRADIENT_HARMONICS, HPPCC_REGION_SMOOTHNESS, PROJECT_ROOT
+from .models import HPPCCGradientModel, HPPCCModel, HPPCCRPCCModel, LinearWhitePreservingModel, RPCCModel
 
 
 _EXIFTOOL_EXE = "exiftool.exe" if sys.platform == "win32" else "exiftool"
@@ -482,6 +482,19 @@ def bradford_adapt_xyz(xyz: np.ndarray, source_white: np.ndarray, target_white: 
 
 
 _D65_WHITE = np.array([0.95047, 1.0, 1.08883], dtype=np.float64)
+_D50_WHITE = np.array([0.96422, 1.0, 0.82521], dtype=np.float64)
+
+
+def bradford_adapt_matrix(source_white: np.ndarray, target_white: np.ndarray) -> np.ndarray:
+    """Return the 3×3 XYZ Bradford adaptation matrix from source to target white.
+
+    For a set of XYZ values expressed under source_white, the adapted values are:
+        xyz_adapted = xyz_source @ M.T
+    """
+    source_lms = BRADFORD_MATRIX @ source_white
+    target_lms = BRADFORD_MATRIX @ target_white
+    scale = np.diag(target_lms / source_lms)
+    return np.linalg.inv(BRADFORD_MATRIX) @ scale @ BRADFORD_MATRIX
 
 
 def identify_unreliable_patches(
@@ -1194,8 +1207,28 @@ def linear_model_to_dict(model: LinearWhitePreservingModel) -> dict[str, object]
     }
 
 
-def hppcc_model_to_dict(model: HPPCCModel) -> dict[str, object]:
+def hppcc_gradient_model_to_dict(model: HPPCCGradientModel) -> dict[str, object]:
     return {
+        "type": "gradient",
+        "coeffs": np.asarray(model.coeffs, dtype=np.float64).tolist(),
+        "white_rgb": np.asarray(model.white_rgb, dtype=np.float64).tolist(),
+        "white_xyz": np.asarray(model.white_xyz, dtype=np.float64).tolist(),
+    }
+
+
+def hppcc_gradient_model_from_dict(payload: dict[str, object]) -> HPPCCGradientModel:
+    return HPPCCGradientModel(
+        coeffs=np.asarray(payload["coeffs"], dtype=np.float64),
+        white_rgb=np.asarray(payload["white_rgb"], dtype=np.float64),
+        white_xyz=np.asarray(payload["white_xyz"], dtype=np.float64),
+    )
+
+
+def hppcc_model_to_dict(model: HPPCCModel | HPPCCGradientModel) -> dict[str, object]:
+    if isinstance(model, HPPCCGradientModel):
+        return hppcc_gradient_model_to_dict(model)
+    return {
+        "type": "constrained",
         "matrices": np.asarray(model.matrices, dtype=np.float64).tolist(),
         "boundaries": np.asarray(model.boundaries, dtype=np.float64).tolist(),
         "white_rgb": np.asarray(model.white_rgb, dtype=np.float64).tolist(),
@@ -1211,7 +1244,9 @@ def linear_model_from_dict(payload: dict[str, object]) -> LinearWhitePreservingM
     )
 
 
-def hppcc_model_from_dict(payload: dict[str, object]) -> HPPCCModel:
+def hppcc_model_from_dict(payload: dict[str, object]) -> HPPCCModel | HPPCCGradientModel:
+    if payload.get("type") == "gradient":
+        return hppcc_gradient_model_from_dict(payload)
     return HPPCCModel(
         matrices=np.asarray(payload["matrices"], dtype=np.float64),
         boundaries=np.asarray(payload["boundaries"], dtype=np.float64),
@@ -1333,6 +1368,8 @@ def summarize_model(
     perform_nonlinear_corrections: bool = True,
     reference_chroma: np.ndarray | None = None,
     reliable_patch_indices: np.ndarray | None = None,
+    use_hppcc_gradient: bool = False,
+    hppcc_gradient_harmonics: int = HPPCC_GRADIENT_HARMONICS,
 ) -> dict[str, object]:
     # Baseline and RPCC train on all patches for numerical stability.
     all_indices = np.arange(measured_rgb.shape[0], dtype=int)
@@ -1389,25 +1426,17 @@ def summarize_model(
                 result["hppcc_rpcc_chroma_error"] = result["rpcc_chroma_error"]
         return result
 
-    hppcc = src_module.fit_hppcc(
-        measured_rgb_train,
-        reference_xyz_train,
-        white_index=white_index_train,
-        chromatic_indices=chromatic_indices_train,
-        k_regions=hppcc_regions,
-        optimize_boundaries=optimize_boundaries,
-        region_smoothness=region_smoothness,
-    )
-    hppcc_xyz = predict_hppcc(hppcc, measured_rgb, use_blending=use_hppcc_blending, blend_width=hppcc_blend_width)
-    hppcc_de00 = delta_e00_summary(src_module, hppcc_xyz, reference_xyz, illuminant_white)
-    result["hppcc"] = hppcc
-    result["hppcc_de00"] = hppcc_de00
-
-    if reference_chroma is not None:
-        result["hppcc_chroma_error"] = chroma_error_summary(src_module, hppcc_xyz, illuminant_white, reference_chroma)
-
-    if perform_nonlinear_corrections:
-        hppcc_rpcc = src_module.fit_hppcc_rpcc(
+    if use_hppcc_gradient:
+        hppcc = src_module.fit_hppcc_gradient(
+            measured_rgb_train,
+            reference_xyz_train,
+            white_index=white_index_train,
+            chromatic_indices=chromatic_indices_train,
+            n_harmonics=hppcc_gradient_harmonics,
+        )
+        hppcc_xyz = hppcc.predict(measured_rgb)
+    else:
+        hppcc = src_module.fit_hppcc(
             measured_rgb_train,
             reference_xyz_train,
             white_index=white_index_train,
@@ -1416,9 +1445,33 @@ def summarize_model(
             optimize_boundaries=optimize_boundaries,
             region_smoothness=region_smoothness,
         )
-        hppcc_rpcc_xyz = predict_hppcc_rpcc(
-            hppcc_rpcc, measured_rgb, use_blending=use_hppcc_blending, blend_width=hppcc_blend_width
-        )
+        hppcc_xyz = predict_hppcc(hppcc, measured_rgb, use_blending=use_hppcc_blending, blend_width=hppcc_blend_width)
+    hppcc_de00 = delta_e00_summary(src_module, hppcc_xyz, reference_xyz, illuminant_white)
+    result["hppcc"] = hppcc
+    result["hppcc_de00"] = hppcc_de00
+
+    if reference_chroma is not None:
+        result["hppcc_chroma_error"] = chroma_error_summary(src_module, hppcc_xyz, illuminant_white, reference_chroma)
+
+    if perform_nonlinear_corrections:
+        if use_hppcc_gradient:
+            xyz_residual = reference_xyz_train - hppcc.predict(measured_rgb_train)
+            rpcc_res = src_module.fit_rpcc(measured_rgb_train, xyz_residual, white_index=white_index_train)
+            hppcc_rpcc = HPPCCRPCCModel(hppcc=hppcc, rpcc_residual=rpcc_res)
+            hppcc_rpcc_xyz = hppcc_rpcc.predict(measured_rgb)
+        else:
+            hppcc_rpcc = src_module.fit_hppcc_rpcc(
+                measured_rgb_train,
+                reference_xyz_train,
+                white_index=white_index_train,
+                chromatic_indices=chromatic_indices_train,
+                k_regions=hppcc_regions,
+                optimize_boundaries=optimize_boundaries,
+                region_smoothness=region_smoothness,
+            )
+            hppcc_rpcc_xyz = predict_hppcc_rpcc(
+                hppcc_rpcc, measured_rgb, use_blending=use_hppcc_blending, blend_width=hppcc_blend_width
+            )
         hppcc_rpcc_de00 = delta_e00_summary(src_module, hppcc_rpcc_xyz, reference_xyz, illuminant_white)
         result["hppcc_rpcc"] = hppcc_rpcc
         result["hppcc_rpcc_de00"] = hppcc_rpcc_de00

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -13,6 +13,9 @@ import rawpy
 RAW_SUFFIXES = frozenset({".nef", ".cr2", ".cr3", ".arw", ".raf", ".dng"})
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"})
 INPUT_SUFFIXES = RAW_SUFFIXES | IMAGE_SUFFIXES
+
+_D50_XYZ = np.array([0.96422, 1.0, 0.82521], dtype=np.float64)
+_D65_XYZ = np.array([0.95047, 1.0, 1.08883], dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,7 @@ class RawLinearImage:
     rgb_xyz_matrix: np.ndarray | None
     color_desc: str
     raw_pattern: np.ndarray | None
+    rgb_xyz_illuminant: np.ndarray | None = field(default=None)
 
 
 def _normalize_wb(user_wb: Iterable[float] | None) -> list[float] | None:
@@ -39,23 +43,22 @@ def _normalize_wb(user_wb: Iterable[float] | None) -> list[float] | None:
     return values
 
 
-def _effective_rgb_xyz_matrix(raw: rawpy.RawPy) -> np.ndarray | None:
-    """Return the best available Camera→XYZ matrix.
+def _effective_rgb_xyz_matrix(raw: rawpy.RawPy) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return (camera→XYZ matrix, illuminant_xyz) from the best available source.
 
     rawpy exposes two sources:
-    - rgb_xyz_matrix: Camera→XYZ (D65), pre-computed by libraw. Present for most DSLRs/mirrorless.
+    - rgb_xyz_matrix: Camera→XYZ_D65, pre-computed by libraw. Present for most DSLRs/mirrorless.
       For DNG files libraw leaves it as an all-zero matrix.
     - color_matrix: XYZ_D50→Camera (DNG ColorMatrix tag). Present in DNG files.
       Inverting its 3×3 sub-block gives Camera→XYZ_D50.
 
-    When rgb_xyz_matrix is degenerate (all zeros or missing), the inverted color_matrix
-    is returned as fallback. Note that it references D50 rather than D65, but for the
-    metadata-baseline comparison this is an acceptable approximation.
+    Returns the matrix and its native illuminant white point so callers can Bradford-adapt
+    the output XYZ to a different working illuminant if needed.
     """
     if raw.rgb_xyz_matrix is not None:
         m = np.asarray(raw.rgb_xyz_matrix, dtype=np.float64)
         if np.any(m != 0.0):
-            return m
+            return m, _D65_XYZ.copy()
 
     if hasattr(raw, "color_matrix") and raw.color_matrix is not None:
         cm = np.asarray(raw.color_matrix, dtype=np.float64)
@@ -65,8 +68,7 @@ def _effective_rgb_xyz_matrix(raw: rawpy.RawPy) -> np.ndarray | None:
             try:
                 # cm3 is XYZ→Camera; invert to get Camera→XYZ rows
                 cam_to_xyz = np.linalg.inv(cm3).T  # shape (3, 3): each row is a camera channel
-                # Expand to (3, 3) in the same convention as rgb_xyz_matrix (N_cfa_channels × 3)
-                return cam_to_xyz
+                return cam_to_xyz, _D50_XYZ.copy()
             except np.linalg.LinAlgError:
                 pass
 
@@ -137,6 +139,7 @@ def load_raw_linear_rgb(
             tuple(w - b for w, b in zip(raw_white, black_per_ch))
             if raw_white is not None else None
         )
+        _matrix_result = _effective_rgb_xyz_matrix(raw)
         return RawLinearImage(
             rgb=rgb,
             black_level_per_channel=tuple(0 for _ in black_per_ch),
@@ -148,9 +151,10 @@ def load_raw_linear_rgb(
             if raw.daylight_whitebalance is not None
             else None,
             white_level=None if raw.white_level is None else int(raw.white_level),
-            rgb_xyz_matrix=_effective_rgb_xyz_matrix(raw),
+            rgb_xyz_matrix=_matrix_result[0] if _matrix_result is not None else None,
             color_desc=color_desc,
             raw_pattern=raw_pattern,
+            rgb_xyz_illuminant=_matrix_result[1] if _matrix_result is not None else None,
         )
 
 
