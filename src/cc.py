@@ -37,11 +37,12 @@ from src.config import (
     HPPCC_BLEND_WIDTH,
     HPPCC_REGION_CANDIDATES,
     IMAGE_DIR,
+    HPPCC_GRADIENT_NEAR_NEUTRAL_CHROMA_THRESHOLD,
     LINEAR_FALLBACK_RANGE_FACTOR,
+    MAX_WHITE_PATCH_LEVEL,
     MIN_WHITE_PATCH_LEVEL,
     OUTPUT_COLORSPACE,
     OUTPUT_FORMAT,
-    PERFORM_NONLINEAR_CORRECTIONS,
     PROCESS_DIR,
     REFERENCE_ILLUMINANT,
     REFERENCE_PATH,
@@ -52,8 +53,10 @@ from src.config import (
     SHOW_DETECTION_PREVIEW,
     SHOW_DEVELOPED_IMAGE_PREVIEW,
     STANDARD_WHITES,
+    USE_HPPCC,
     USE_HPPCC_BLENDING,
     USE_METADATA_RGB_XYZ_BASELINE,
+    USE_RPCC,
     WHITE_INDEX,
 )
 from src.report import (
@@ -99,6 +102,8 @@ from src.utils import (
     estimate_noise_profile_from_patches,
     find_raw_path,
     find_raw_paths,
+    hlcc_model_from_dict,
+    hlcc_model_to_dict,
     hppcc_model_from_dict,
     hppcc_model_to_dict,
     hppcc_rpcc_model_from_dict,
@@ -106,6 +111,10 @@ from src.utils import (
     identify_unreliable_patches,
     linear_model_from_dict,
     linear_model_to_dict,
+    lwcc_model_from_dict,
+    lwcc_model_to_dict,
+    tps_model_from_dict,
+    tps_model_to_dict,
     load_reference_chroma,
     load_reference_white_xyz,
     load_reference_xyz,
@@ -149,8 +158,8 @@ PROCESS_SETTING_NAMES = (
     "use_metadata_rgb_xyz_baseline",
     "use_hppcc_blending",
     "hppcc_blend_width",
-    "perform_nonlinear_corrections",
-    "simple_linear",
+    "use_hppcc",
+    "use_rpcc",
     "hppcc_gradient",
     "hppcc_gradient_harmonics",
     "show_detection_preview",
@@ -217,6 +226,7 @@ def run_analysis(args) -> None:
     # instead (see the prediction step below).
     white_patch_level = float(np.max(normalized_rgb[int(args.white_index)]))
     chart_underexposed = white_patch_level < MIN_WHITE_PATCH_LEVEL
+    chart_overexposed  = white_patch_level > MAX_WHITE_PATCH_LEVEL
     if chart_underexposed:
         print(
             f"\nWARNING: ColorChecker is under-exposed — the white patch reaches "
@@ -226,6 +236,17 @@ def run_analysis(args) -> None:
             f"will be used for the full image instead.\n"
             f"  For best accuracy re-shoot the chart brighter — aim for the white "
             f"patch around 60-90% of full scale, without clipping.\n"
+        )
+    if chart_overexposed:
+        print(
+            f"\nWARNING: ColorChecker is over-exposed — the white patch reaches "
+            f"{white_patch_level * 100:.1f}% of sensor full scale (clipping threshold "
+            f"{MAX_WHITE_PATCH_LEVEL * 100:.0f}%).\n"
+            f"  One or more channels of the white patch may be clipped; the measured "
+            f"white_rgb is biased and the derived correction matrices are unreliable.\n"
+            f"  The linear baseline correction will be used for the full image instead.\n"
+            f"  For best accuracy re-shoot the chart — aim for the white patch around "
+            f"60-90% of full scale, without clipping.\n"
         )
 
     white_field_params = None
@@ -379,7 +400,8 @@ def run_analysis(args) -> None:
     save_json_grid_preview(args.analysis_dir, make_json_grid_preview, corrected_rgb)
 
     use_hppcc_gradient = bool(getattr(args, "hppcc_gradient", False))
-    use_simple_linear = bool(getattr(args, "simple_linear", False))
+    use_hppcc = bool(getattr(args, "use_hppcc", USE_HPPCC))
+    use_rpcc = bool(getattr(args, "use_rpcc", USE_RPCC))
     gradient_harmonics = int(getattr(args, "hppcc_gradient_harmonics", 2))
     # Gradient model is region-independent: iterate candidates only for constrained HPPCC.
     candidates_to_try = (
@@ -401,7 +423,8 @@ def run_analysis(args) -> None:
             use_hppcc_blending=args.use_hppcc_blending,
             hppcc_blend_width=args.hppcc_blend_width,
             region_smoothness=args.hppcc_region_smoothness,
-            perform_nonlinear_corrections=args.perform_nonlinear_corrections,
+            use_hppcc=use_hppcc,
+            use_rpcc=use_rpcc,
             reference_chroma=reference_chroma,
             reliable_patch_indices=reliable_patch_indices,
             use_hppcc_gradient=use_hppcc_gradient,
@@ -411,7 +434,8 @@ def run_analysis(args) -> None:
 
     best_candidate_index = print_hppcc_candidate_report(
         hppcc_candidate_results,
-        perform_nonlinear_corrections=args.perform_nonlinear_corrections,
+        use_hppcc=use_hppcc,
+        use_rpcc=use_rpcc,
         use_hppcc_blending=args.use_hppcc_blending,
         hppcc_blend_width=args.hppcc_blend_width,
     )
@@ -440,6 +464,40 @@ def run_analysis(args) -> None:
             best["baseline_de00"] = metadata_de00
             print("  -> Using adapted metadata matrix as baseline (lower ΔE than fitted model).")
 
+    # When the gradient model is active, check whether any chromatic training
+    # patch is near-neutral in sensor space.  For such patches the hue angle
+    # arctan2(g/S-1/3, r/S-1/3) is dominated by shot noise (chromaticity
+    # magnitude << 0.02 vs 0.05-0.15 for saturated colours), so the
+    # per-pixel Fourier correction produces severe spatial grain in those
+    # image areas.  Fall back to the linear baseline in that case.
+    gradient_near_neutral = False
+    if use_hppcc_gradient and not chart_underexposed and not chart_overexposed:
+        chrom_idx = np.asarray(args.chromatic_indices, dtype=int)
+        patch_rgb = corrected_rgb[chrom_idx]             # (N_chrom, 3)
+        denom_chrom = patch_rgb.sum(axis=1, keepdims=True).clip(1e-12)
+        r_chrom = patch_rgb[:, 0:1] / denom_chrom
+        g_chrom = patch_rgb[:, 1:2] / denom_chrom
+        chroma_mag = np.sqrt((r_chrom - 1.0 / 3.0) ** 2 + (g_chrom - 1.0 / 3.0) ** 2).ravel()
+        near_neutral_mask = chroma_mag < HPPCC_GRADIENT_NEAR_NEUTRAL_CHROMA_THRESHOLD
+        if np.any(near_neutral_mask):
+            gradient_near_neutral = True
+            affected = [
+                CLASSIC_24_PATCH_NAMES[int(chrom_idx[i])]
+                for i in np.flatnonzero(near_neutral_mask)
+            ]
+            print(
+                f"\nWARNING: HPPCC gradient — near-neutral chromatic patch(es) detected.\n"
+                f"  Affected: {', '.join(affected)}\n"
+                f"  In sensor space these patches have very low chromaticity "
+                f"(magnitude < {HPPCC_GRADIENT_NEAR_NEUTRAL_CHROMA_THRESHOLD:.3f}),\n"
+                f"  so the hue angle is dominated by shot noise. The gradient model "
+                f"would produce severe\n"
+                f"  spatial grain in image areas with similar sensor-level chromaticity.\n"
+                f"  The linear baseline correction will be used for the full image instead.\n"
+                f"  Consider using the piecewise HPPCC (without --hppcc-gradient) "
+                f"which is not affected by this issue.\n"
+            )
+
     normalized_full_rgb = normalize_with_sensor_levels(
         raw.rgb,
         sensor_black_levels_rgb,
@@ -466,10 +524,10 @@ def run_analysis(args) -> None:
             radius=float(args.sharpen_radius),
             threshold=float(args.sharpen_threshold),
         )
-    if use_simple_linear:
+    if not use_hppcc:
         corrected_full_xyz = best["baseline"].predict(normalized_full_rgb)
         output_label = "baseline"
-    elif args.perform_nonlinear_corrections:
+    elif use_rpcc and "hppcc_rpcc" in best:
         corrected_full_xyz = predict_hppcc_rpcc(
             best["hppcc_rpcc"],
             normalized_full_rgb,
@@ -491,7 +549,7 @@ def run_analysis(args) -> None:
     # stay sane instead of casting.
     training_max_rgb = float(np.max(corrected_rgb))
     linear_full_xyz = best["baseline"].predict(normalized_full_rgb)
-    if chart_underexposed:
+    if chart_underexposed or chart_overexposed or gradient_near_neutral:
         corrected_full_xyz = linear_full_xyz
         output_label = "baseline"
     else:
@@ -518,10 +576,20 @@ def run_analysis(args) -> None:
     models_payload: dict[str, object] = {
         "baseline": linear_model_to_dict(best["baseline"]),
         "rpcc": rpcc_model_to_dict(best["rpcc"]),
-        "hppcc": hppcc_model_to_dict(best["hppcc"]),
+        "rpcc_ridge": rpcc_model_to_dict(best["rpcc_ridge"]),
     }
-    if args.perform_nonlinear_corrections:
-        models_payload["hppcc_rpcc"] = hppcc_rpcc_model_to_dict(best["hppcc_rpcc"])
+    if use_hppcc:
+        models_payload["hppcc"] = hppcc_model_to_dict(best["hppcc"])
+        if use_rpcc and "hppcc_rpcc" in best:
+            models_payload["hppcc_rpcc"] = hppcc_rpcc_model_to_dict(best["hppcc_rpcc"])
+        if "hlcc" in best:
+            models_payload["hlcc"] = hlcc_model_to_dict(best["hlcc"])
+    if "tps" in best:
+        models_payload["tps"] = tps_model_to_dict(best["tps"])
+    if "lwcc" in best:
+        models_payload["lwcc"] = lwcc_model_to_dict(best["lwcc"])
+    if "de00_opt" in best:
+        models_payload["de00_opt"] = linear_model_to_dict(best["de00_opt"])
     result_json_path = save_analysis_result(
         args.analysis_dir,
         raw_path,
@@ -548,14 +616,18 @@ def run_analysis(args) -> None:
                 "sharpen_threshold": float(args.sharpen_threshold),
                 "use_metadata_rgb_xyz_baseline": bool(args.use_metadata_rgb_xyz_baseline),
                 "training_max_rgb": training_max_rgb,
-                "use_linear_only": bool(chart_underexposed),
+                "use_linear_only": bool(chart_underexposed or chart_overexposed or gradient_near_neutral),
+                "chart_underexposed": bool(chart_underexposed),
+                "chart_overexposed": bool(chart_overexposed),
+                "gradient_near_neutral": bool(gradient_near_neutral),
                 "use_hppcc_blending": bool(args.use_hppcc_blending),
                 "hppcc_blend_width": float(args.hppcc_blend_width),
                 "hppcc_region_smoothness": float(args.hppcc_region_smoothness),
-                "perform_nonlinear_corrections": bool(args.perform_nonlinear_corrections),
-                "simple_linear": bool(use_simple_linear),
+                "use_hppcc": bool(use_hppcc),
+                "use_rpcc": bool(use_rpcc),
                 "hppcc_gradient": bool(use_hppcc_gradient),
                 "hppcc_gradient_harmonics": int(gradient_harmonics),
+                "output_label": output_label,
                 "output_format": args.output_format,
                 "output_colorspace": args.output_colorspace,
                 "undistort": undistort_info if undistort_info is not None
@@ -580,20 +652,18 @@ def run_analysis(args) -> None:
         corrected_rgb,
     )
     primary_model = (
-        best["hppcc"] if use_simple_linear
-        else best["hppcc_rpcc"] if args.perform_nonlinear_corrections
-        else best["hppcc"]
+        best["hppcc_rpcc"] if (use_hppcc and use_rpcc and "hppcc_rpcc" in best)
+        else best.get("hppcc", best["baseline"])
     )
     _hppcc_label = "hppcc_gradient" if use_hppcc_gradient else "hppcc"
-    _linear_only = use_simple_linear or chart_underexposed
+    _linear_only = (not use_hppcc) or chart_underexposed or chart_overexposed or gradient_near_neutral
     print_model_report(
         best,
         selected_k_regions,
-        perform_nonlinear_corrections=args.perform_nonlinear_corrections,
+        use_hppcc=use_hppcc,
+        use_rpcc=use_rpcc,
         use_hppcc_blending=args.use_hppcc_blending,
         hppcc_blend_width=args.hppcc_blend_width,
-        use_simple_linear=use_simple_linear,
-        chart_underexposed=chart_underexposed,
         use_hppcc_gradient=use_hppcc_gradient,
     )
     _gradient_model = None
@@ -650,9 +720,9 @@ def run_analysis(args) -> None:
         white_patch_level=white_patch_level,
         chart_underexposed=chart_underexposed,
         training_max_rgb=training_max_rgb,
-        use_simple_linear=use_simple_linear,
+        use_hppcc=use_hppcc,
+        use_rpcc=use_rpcc,
         use_hppcc_gradient=use_hppcc_gradient,
-        perform_nonlinear_corrections=args.perform_nonlinear_corrections,
         selected_k_regions=selected_k_regions,
         output_label=output_label,
         neutral_gradient=neutral_gradient_report,
@@ -678,9 +748,19 @@ def run_process(args) -> None:
     settings = _merge_process_settings(payload["settings"], args)
     diagnostics = payload.get("diagnostics", {})
     models_payload = payload["models"]
-    use_nonlinear = bool(settings.get("perform_nonlinear_corrections", "hppcc_rpcc" in models_payload))
-    if use_nonlinear and "hppcc_rpcc" not in models_payload:
-        raise ValueError("The saved analysis result does not contain an HPPCC+RPCC model, so --perform-nonlinear-corrections cannot be enabled.")
+    # Determine which model was selected during analysis.
+    # New JSONs store output_label explicitly; old JSONs use perform_nonlinear_corrections flag.
+    saved_output_label = settings.get("output_label")
+    if saved_output_label is None:
+        # Legacy JSON: derive from old flags
+        _old_nonlinear = bool(settings.get("perform_nonlinear_corrections", "hppcc_rpcc" in models_payload))
+        _old_simple = bool(settings.get("simple_linear", False))
+        if _old_simple:
+            saved_output_label = "baseline"
+        elif _old_nonlinear and "hppcc_rpcc" in models_payload:
+            saved_output_label = "hppcc_rpcc"
+        else:
+            saved_output_label = "hppcc"
 
     raw_paths = find_raw_paths(args.folder_to_process, recursive=bool(getattr(args, "recursive", False)))
     if not raw_paths:
@@ -702,14 +782,14 @@ def run_process(args) -> None:
 
     if worker_count == 1:
         for raw_path in raw_paths:
-            output_paths = _process_single_raw(raw_path, output_dir, settings, diagnostics, models_payload, use_nonlinear)
+            output_paths = _process_single_raw(raw_path, output_dir, settings, diagnostics, models_payload, saved_output_label)
             outputs_text = ", ".join(str(path) for path in output_paths)
             print(f"Processed: {raw_path} -> {outputs_text}")
         return
 
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         futures = {
-            executor.submit(_process_single_raw, raw_path, output_dir, settings, diagnostics, models_payload, use_nonlinear): raw_path
+            executor.submit(_process_single_raw, raw_path, output_dir, settings, diagnostics, models_payload, saved_output_label): raw_path
             for raw_path in raw_paths
         }
         for future in as_completed(futures):
@@ -725,7 +805,7 @@ def _process_single_raw(
     settings: dict[str, object],
     diagnostics: dict[str, object],
     models_payload: dict[str, object],
-    use_nonlinear: bool,
+    output_label: str,
 ) -> list[Path]:
     use_blending = bool(settings["use_hppcc_blending"])
     blend_width = float(settings["hppcc_blend_width"])
@@ -781,21 +861,58 @@ def _process_single_raw(
     # and fall back to the white patch level, which bounds the training range.
     baseline_model = linear_model_from_dict(models_payload["baseline"])
     neutral_gradient = diagnostics.get("neutral_gradient")
-    use_simple_linear_proc = bool(settings.get("simple_linear", False))
-    if bool(settings.get("use_linear_only", False)) or use_simple_linear_proc:
-        # Under-exposed chart or explicit simple-linear mode: baseline only.
-        corrected_full_xyz = baseline_model.predict(normalized_full_rgb)
-    else:
-        if use_nonlinear:
-            model = hppcc_rpcc_model_from_dict(models_payload["hppcc_rpcc"])
-            corrected_full_xyz = predict_hppcc_rpcc(
-                model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width,
-            )
+
+    # When the analysis forced a linear fallback, warn and honour that decision.
+    use_linear_only = bool(settings.get("use_linear_only", False))
+    if use_linear_only and output_label == "baseline":
+        if settings.get("chart_underexposed", False):
+            reason = "the ColorChecker was under-exposed during analysis"
+        elif settings.get("chart_overexposed", False):
+            reason = "the ColorChecker was over-exposed (white patch clipped) during analysis"
+        elif settings.get("gradient_near_neutral", False):
+            reason = ("the HPPCC gradient model detected near-neutral chromatic patch(es) "
+                      "during analysis — gradient correction would produce spatial grain")
         else:
-            model = hppcc_model_from_dict(models_payload["hppcc"])
-            corrected_full_xyz = predict_hppcc(
-                model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width,
-            )
+            reason = "the chart conditions during analysis were sub-optimal"
+        print(
+            f"\nWARNING: Using the linear baseline correction for {raw_path.name}.\n"
+            f"  Reason: {reason}.\n"
+            f"  Advanced correction is disabled as recorded in the analysis JSON.\n"
+        )
+
+    if output_label == "baseline":
+        corrected_full_xyz = baseline_model.predict(normalized_full_rgb)
+    elif output_label == "rpcc":
+        model = rpcc_model_from_dict(models_payload["rpcc"])
+        corrected_full_xyz = model.predict(normalized_full_rgb)
+    elif output_label == "rpcc_ridge":
+        model = rpcc_model_from_dict(models_payload["rpcc_ridge"])
+        corrected_full_xyz = model.predict(normalized_full_rgb)
+    elif output_label == "hppcc_rpcc":
+        model = hppcc_rpcc_model_from_dict(models_payload["hppcc_rpcc"])
+        corrected_full_xyz = predict_hppcc_rpcc(
+            model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width,
+        )
+    elif output_label == "hlcc":
+        model = hlcc_model_from_dict(models_payload["hlcc"])
+        corrected_full_xyz = model.predict(normalized_full_rgb)
+    elif output_label == "tps":
+        model = tps_model_from_dict(models_payload["tps"])
+        corrected_full_xyz = model.predict(normalized_full_rgb)
+    elif output_label == "lwcc":
+        model = lwcc_model_from_dict(models_payload["lwcc"])
+        corrected_full_xyz = model.predict(normalized_full_rgb)
+    elif output_label == "de00_opt":
+        model = linear_model_from_dict(models_payload["de00_opt"])
+        corrected_full_xyz = model.predict(normalized_full_rgb)
+    else:
+        # Default / "hppcc"
+        model = hppcc_model_from_dict(models_payload["hppcc"])
+        corrected_full_xyz = predict_hppcc(
+            model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width,
+        )
+
+    if output_label != "baseline":
         # Fade to the linear baseline above the fitted tonal range so
         # out-of-range highlights stay sane instead of casting.
         training_max_rgb = settings.get("training_max_rgb")

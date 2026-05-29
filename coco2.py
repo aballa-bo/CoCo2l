@@ -937,14 +937,13 @@ class AnalyzeTab(QWidget):
         self._cs = QComboBox(); self._cs.addItems(["sRGB", "Display-P3"])
         opts.addWidget(self._cs)
         opts.addSpacing(20)
-        self._simple_linear = QCheckBox("Simple linear")
-        self._simple_linear.setChecked(False)
-        self._simple_linear.toggled.connect(self._on_simple_linear_toggled)
-        opts.addWidget(self._simple_linear)
+        self._use_hppcc = QCheckBox("HPPCC")
+        self._use_hppcc.setChecked(True)   # mirrors USE_HPPCC default
+        opts.addWidget(self._use_hppcc)
         opts.addSpacing(8)
-        self._nonlinear = QCheckBox("Non linear corrections")
-        self._nonlinear.setChecked(True)   # mirrors PERFORM_NONLINEAR_CORRECTIONS default
-        opts.addWidget(self._nonlinear)
+        self._use_rpcc = QCheckBox("RPCC")
+        self._use_rpcc.setChecked(True)    # mirrors USE_RPCC default
+        opts.addWidget(self._use_rpcc)
         opts.addSpacing(8)
         self._hppcc_gradient = QCheckBox("HPPCC gradient")
         self._hppcc_gradient.setChecked(False)

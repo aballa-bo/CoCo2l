@@ -405,38 +405,67 @@ def print_hppcc_gradient_contribution_report(
 def print_hppcc_candidate_report(
     candidate_results: list[dict[str, object]],
     *,
-    perform_nonlinear_corrections: bool,
-    use_hppcc_blending: bool,
-    hppcc_blend_width: float,
+    use_hppcc: bool = True,
+    use_rpcc: bool = True,
+    use_hppcc_blending: bool = False,
+    hppcc_blend_width: float = 0.15,
 ) -> int:
+    """Print a comparison table of all fitted models for each k-region candidate.
+
+    Returns the index of the candidate with the lowest primary-model dE00.
+    The primary model is: hppcc_rpcc (if use_hppcc and use_rpcc and available),
+    hppcc (if use_hppcc only), or baseline.
+    """
     print()
-    print("Multi-k model comparison (scene-measured white, optimised boundaries)")
-    if use_hppcc_blending:
-        print(f"Prediction mode: blending (blend_width={hppcc_blend_width:.3f})")
-    else:
-        print("Prediction mode: hard")
+    print("Model comparison — mean dE00 (scene-measured white, optimised boundaries)")
+    if use_hppcc and use_hppcc_blending:
+        print(f"HPPCC prediction mode: blending (blend_width={hppcc_blend_width:.3f})")
+
+    # Collect all method keys that appear in any candidate's best dict
+    _method_order = [
+        ("baseline",    "baseline"),
+        ("rpcc",        "rpcc"),
+        ("rpcc_ridge",  "rpcc_ridge"),
+        ("hppcc",       "hppcc"),
+        ("hppcc_rpcc",  "hppcc+rpcc"),
+        ("hlcc",        "hlcc"),
+        ("tps",         "tps"),
+        ("lwcc",        "lwcc"),
+        ("de00_opt",    "de00_opt"),
+    ]
+    present_methods = []
+    for key, label in _method_order:
+        if any(f"{key}_de00" in r["best"] for r in candidate_results):
+            present_methods.append((key, label))
+
+    col_w = max(len(lbl) for _, lbl in present_methods) + 2
+    header = " ".join(f"{lbl:>{col_w}}" for _, lbl in present_methods)
+    print(f"{'k':>4}  {header}")
+
     best_index = 0
     best_value = float("inf")
     for index, result in enumerate(candidate_results):
         best = result["best"]
-        baseline_mean = float(np.mean(best["baseline_de00"]))
-        rpcc_mean = float(np.mean(best["rpcc_de00"]))
-        hppcc_mean = float(np.mean(best["hppcc_de00"]))
-        primary_mean = hppcc_mean
-        line = (
-            f"k={int(result['k'])}  "
-            f"baseline={baseline_mean:.4f}  "
-            f"rpcc={rpcc_mean:.4f}  "
-            f"hppcc={hppcc_mean:.4f}"
-        )
-        if perform_nonlinear_corrections and "hppcc_rpcc_de00" in best:
-            hppcc_rpcc_mean = float(np.mean(best["hppcc_rpcc_de00"]))
-            line += f"  hppcc+rpcc={hppcc_rpcc_mean:.4f}"
-            primary_mean = hppcc_rpcc_mean
-        print(line)
-        if primary_mean < best_value:
-            best_value = primary_mean
+        vals = []
+        for key, _ in present_methods:
+            de_key = f"{key}_de00"
+            if de_key in best:
+                vals.append(f"{float(np.mean(best[de_key])):>{col_w}.4f}")
+            else:
+                vals.append(f"{'—':>{col_w}}")
+        print(f"{int(result['k']):>4}  {' '.join(vals)}")
+
+        # Determine primary metric for k selection
+        if use_hppcc and use_rpcc and "hppcc_rpcc_de00" in best:
+            primary = float(np.mean(best["hppcc_rpcc_de00"]))
+        elif use_hppcc and "hppcc_de00" in best:
+            primary = float(np.mean(best["hppcc_de00"]))
+        else:
+            primary = float(np.mean(best["baseline_de00"]))
+        if primary < best_value:
+            best_value = primary
             best_index = index
+
     print()
     print(f"Selected k: {int(candidate_results[best_index]['k'])}")
     return best_index
@@ -446,48 +475,37 @@ def print_model_report(
     best: dict[str, object],
     hppcc_regions: int,
     *,
-    perform_nonlinear_corrections: bool,
-    use_hppcc_blending: bool,
-    hppcc_blend_width: float,
-    use_simple_linear: bool = False,
-    chart_underexposed: bool = False,
+    use_hppcc: bool = True,
+    use_rpcc: bool = True,
+    use_hppcc_blending: bool = False,
+    hppcc_blend_width: float = 0.15,
     use_hppcc_gradient: bool = False,
 ) -> None:
+    """Print a concise per-model accuracy summary for the selected k."""
+    _method_order = [
+        ("baseline",   "Baseline 3x3 linear"),
+        ("rpcc",       "RPCC (Root-Polynomial)"),
+        ("rpcc_ridge", "RPCC + Ridge"),
+        ("hppcc",      ("HPPCC gradient" if use_hppcc_gradient else f"HPPCC ({hppcc_regions} regions)")),
+        ("hppcc_rpcc", ("HPPCC gradient + RPCC" if use_hppcc_gradient else f"HPPCC + RPCC ({hppcc_regions} regions)")),
+        ("hlcc",       f"HLCC ({hppcc_regions} sectors)"),
+        ("tps",        "TPS (Thin-Plate Spline)"),
+        ("lwcc",       "LWCC (Locally Weighted)"),
+        ("de00_opt",   "CIEDE2000-optimised linear"),
+    ]
     print()
-    print("Baseline white-preserving 3x3")
-    print("deltaE00 mean:", float(np.mean(best["baseline_de00"])))
-    print("deltaE00 median:", float(np.median(best["baseline_de00"])))
-    print("deltaE00 max:", float(np.max(best["baseline_de00"])))
-
-    if use_simple_linear or chart_underexposed:
-        return
-
-    print()
-    if use_hppcc_gradient:
-        print("HPPCC gradient")
-    else:
-        print(f"HPPCC ({hppcc_regions} regions)")
-        if use_hppcc_blending:
-            print(f"prediction mode: blending (blend_width={hppcc_blend_width:.3f})")
-        else:
-            print("prediction mode: hard")
-    print("deltaE00 mean:", float(np.mean(best["hppcc_de00"])))
-    print("deltaE00 median:", float(np.median(best["hppcc_de00"])))
-    print("deltaE00 max:", float(np.max(best["hppcc_de00"])))
-
-    if perform_nonlinear_corrections and "hppcc_rpcc" in best:
-        print()
-        if use_hppcc_gradient:
-            print("HPPCC gradient + RPCC residual")
-        else:
-            print(f"HPPCC + RPCC residual ({hppcc_regions} regions)")
-            if use_hppcc_blending:
-                print(f"prediction mode: blending (blend_width={hppcc_blend_width:.3f})")
-            else:
-                print("prediction mode: hard")
-        print("deltaE00 mean:", float(np.mean(best["hppcc_rpcc_de00"])))
-        print("deltaE00 median:", float(np.median(best["hppcc_rpcc_de00"])))
-        print("deltaE00 max:", float(np.max(best["hppcc_rpcc_de00"])))
+    print("Model accuracy (deltaE00 on training patches)")
+    for key, label in _method_order:
+        de_key = f"{key}_de00"
+        if de_key not in best:
+            continue
+        de = best[de_key]
+        print(
+            f"  {label:<40}  mean={float(np.mean(de)):.4f}  "
+            f"median={float(np.median(de)):.4f}  max={float(np.max(de)):.4f}"
+        )
+    if use_hppcc and use_hppcc_blending:
+        print(f"  (HPPCC prediction mode: blending, blend_width={hppcc_blend_width:.3f})")
 
 
 # ---------------------------------------------------------------------------
@@ -555,9 +573,9 @@ def save_analysis_text_report(
     white_patch_level: float,
     chart_underexposed: bool,
     training_max_rgb: float,
-    use_simple_linear: bool,
+    use_hppcc: bool,
+    use_rpcc: bool,
     use_hppcc_gradient: bool,
-    perform_nonlinear_corrections: bool,
     selected_k_regions: int,
     output_label: str,
     neutral_gradient: dict | None,
@@ -596,10 +614,12 @@ def save_analysis_text_report(
     if chart_underexposed:
         _s(f"  WARNING: chart under-exposed (< {25:.0f}% threshold) — linear-only mode")
     _s(f"Training max RGB     : {training_max_rgb:.5f}")
-    _s(f"HPPCC gradient       : {'yes' if use_hppcc_gradient else 'no'}")
-    if not use_hppcc_gradient:
-        _s(f"HPPCC regions        : {selected_k_regions}")
-    _s(f"Nonlinear (RPCC)     : {'yes' if perform_nonlinear_corrections else 'no'}")
+    _s(f"HPPCC               : {'yes' if use_hppcc else 'no (linear baseline only)'}")
+    if use_hppcc:
+        _s(f"HPPCC gradient       : {'yes' if use_hppcc_gradient else 'no'}")
+        if not use_hppcc_gradient:
+            _s(f"HPPCC regions        : {selected_k_regions}")
+        _s(f"RPCC residual        : {'yes' if use_rpcc else 'no'}")
     _s(f"Output method        : {output_label}")
 
     # --------------------------------------------------------- neutral gradient
@@ -632,11 +652,21 @@ def save_analysis_text_report(
                            float(np.max(de)), float(np.percentile(de, 95)))
         _s(f"  {label:<22}  {m:7.4f}  {med:7.4f}  {mx:7.4f}  {p95:7.4f}  {_de00_quality(m)}")
 
-    _row("baseline", best["baseline_de00"])
-    if not linear_only:
-        _row(hppcc_label, best["hppcc_de00"])
-        if perform_nonlinear_corrections and "hppcc_rpcc_de00" in best:
-            _row(f"{hppcc_label}+rpcc", best["hppcc_rpcc_de00"])
+    # All available methods in display order
+    _de00_methods = [
+        ("baseline",    "baseline"),
+        ("rpcc",        "rpcc"),
+        ("rpcc_ridge",  "rpcc_ridge"),
+        ("hppcc",       hppcc_label),
+        ("hppcc_rpcc",  f"{hppcc_label}+rpcc"),
+        ("hlcc",        "hlcc"),
+        ("tps",         "tps"),
+        ("lwcc",        "lwcc"),
+        ("de00_opt",    "de00_opt"),
+    ]
+    for key, lbl in _de00_methods:
+        if f"{key}_de00" in best:
+            _row(lbl, best[f"{key}_de00"])
 
     # -------------------------------------------------- per-model chroma table
     _s("")
@@ -651,54 +681,70 @@ def save_analysis_text_report(
         mx = float(np.max(np.abs(dc)))
         _s(f"  {label:<22}  {ma:9.4f}  {bias:+7.4f}  {mx:9.4f}  {_dc_quality(ma, bias)}")
 
-    _crow("baseline", best["baseline_chroma_error"])
-    if not linear_only:
-        if "hppcc_chroma_error" in best:
-            _crow(hppcc_label, best["hppcc_chroma_error"])
-        if perform_nonlinear_corrections and "hppcc_rpcc_chroma_error" in best:
-            _crow(f"{hppcc_label}+rpcc", best["hppcc_rpcc_chroma_error"])
+    _dc_methods = [
+        ("baseline_chroma_error",    "baseline"),
+        ("rpcc_chroma_error",        "rpcc"),
+        ("rpcc_ridge_chroma_error",  "rpcc_ridge"),
+        ("hppcc_chroma_error",       hppcc_label),
+        ("hppcc_rpcc_chroma_error",  f"{hppcc_label}+rpcc"),
+        ("hlcc_chroma_error",        "hlcc"),
+        ("tps_chroma_error",         "tps"),
+        ("lwcc_chroma_error",        "lwcc"),
+        ("de00_opt_chroma_error",    "de00_opt"),
+    ]
+    for ckey, clbl in _dc_methods:
+        if ckey in best:
+            _crow(clbl, best[ckey])
 
     # --------------------------------------------------------- per-patch dE00
     _s("")
     _s("deltaE00 PER PATCH")
     _s(thin)
     chromatic_set = set(int(i) for i in chromatic_indices)
-    header = f"  {'#':>2}  {'patch':<17}  {'type':<8}  {'baseline':>8}"
-    if not linear_only:
-        header += f"  {hppcc_label:>14}"
-        if perform_nonlinear_corrections and "hppcc_rpcc_de00" in best:
-            header += f"  {hppcc_label+'+rpcc':>19}"
+    # Show baseline + the output method only in the patch table to keep it readable
+    patch_cols = [("baseline_de00", "baseline")]
+    if not linear_only and f"{hppcc_label}_de00" in best:
+        patch_cols.append((f"{hppcc_label}_de00", hppcc_label))
+    elif not linear_only and "hppcc_de00" in best:
+        patch_cols.append(("hppcc_de00", hppcc_label))
+    header = f"  {'#':>2}  {'patch':<17}  {'type':<8}"
+    for _, lbl in patch_cols:
+        header += f"  {lbl:>14}"
     _s(header)
     _s("  " + "-" * (len(header) - 2))
     for i, name in enumerate(patch_names):
         ptype = "chrom" if i in chromatic_set else "neutral"
-        bl = float(best["baseline_de00"][i])
-        row = f"  {i + 1:02d}  {name:<17}  {ptype:<8}  {bl:8.4f}"
-        if not linear_only:
-            row += f"  {float(best['hppcc_de00'][i]):14.4f}"
-            if perform_nonlinear_corrections and "hppcc_rpcc_de00" in best:
-                row += f"  {float(best['hppcc_rpcc_de00'][i]):19.4f}"
+        row = f"  {i + 1:02d}  {name:<17}  {ptype:<8}"
+        for col_key, _ in patch_cols:
+            row += f"  {float(best[col_key][i]):14.4f}"
         _s(row)
 
     # --------------------------------------------------------- per-patch dC*
     _s("")
     _s("deltaC* PER PATCH")
     _s(thin)
-    header_c = f"  {'#':>2}  {'patch':<17}  {'type':<8}  {'baseline':>9}"
-    if not linear_only and "hppcc_chroma_error" in best:
-        header_c += f"  {hppcc_label:>14}"
-        if perform_nonlinear_corrections and "hppcc_rpcc_chroma_error" in best:
-            header_c += f"  {hppcc_label+'+rpcc':>19}"
+    patch_dc_cols = [("baseline_chroma_error", "baseline")]
+    if not linear_only:
+        for ckey, clbl in [
+            (f"{hppcc_label}_chroma_error", hppcc_label),
+            ("hppcc_chroma_error", hppcc_label),
+        ]:
+            if ckey in best:
+                patch_dc_cols.append((ckey, clbl))
+                break
+    header_c = f"  {'#':>2}  {'patch':<17}  {'type':<8}"
+    for _, clbl in patch_dc_cols:
+        header_c += f"  {clbl:>14}"
     _s(header_c)
     _s("  " + "-" * (len(header_c) - 2))
     for i, name in enumerate(patch_names):
         ptype = "chrom" if i in chromatic_set else "neutral"
-        bl = float(best["baseline_chroma_error"][i])
-        row = f"  {i + 1:02d}  {name:<17}  {ptype:<8}  {bl:+9.4f}"
-        if not linear_only and "hppcc_chroma_error" in best:
-            row += f"  {float(best['hppcc_chroma_error'][i]):+14.4f}"
-            if perform_nonlinear_corrections and "hppcc_rpcc_chroma_error" in best:
-                row += f"  {float(best['hppcc_rpcc_chroma_error'][i]):+19.4f}"
+        row = f"  {i + 1:02d}  {name:<17}  {ptype:<8}"
+        for ckey, _ in patch_dc_cols:
+            if ckey in best:
+                row += f"  {float(best[ckey][i]):+14.4f}"
+            else:
+                row += f"  {'—':>14}"
         _s(row)
 
     # ---------------------------------------------------------------- summary
@@ -712,11 +758,17 @@ def save_analysis_text_report(
     used_dc = best["baseline_chroma_error"]
     used_label = "baseline"
     if not linear_only:
-        if perform_nonlinear_corrections and "hppcc_rpcc_de00" in best:
+        out_de_key = f"{output_label}_de00"
+        out_dc_key = f"{output_label}_chroma_error"
+        if out_de_key in best:
+            used_de = best[out_de_key]
+            used_dc = best.get(out_dc_key, used_dc)
+            used_label = output_label
+        elif "hppcc_rpcc_de00" in best and use_rpcc:
             used_de = best["hppcc_rpcc_de00"]
             used_dc = best.get("hppcc_rpcc_chroma_error", used_dc)
             used_label = f"{hppcc_label}+rpcc"
-        else:
+        elif "hppcc_de00" in best:
             used_de = best["hppcc_de00"]
             used_dc = best.get("hppcc_chroma_error", used_dc)
             used_label = hppcc_label

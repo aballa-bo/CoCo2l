@@ -22,7 +22,6 @@ from src.config import (
     IMAGE_DIR,
     OUTPUT_COLORSPACE,
     OUTPUT_FORMAT,
-    PERFORM_NONLINEAR_CORRECTIONS,
     PROCESS_DIR,
     REFERENCE_ILLUMINANT,
     REFERENCE_PATH,
@@ -33,10 +32,11 @@ from src.config import (
     SHARPEN_THRESHOLD,
     SHOW_DETECTION_PREVIEW,
     SHOW_DEVELOPED_IMAGE_PREVIEW,
-    SIMPLE_LINEAR,
     STANDARD_WHITES,
+    USE_HPPCC,
     USE_HPPCC_BLENDING,
     USE_METADATA_RGB_XYZ_BASELINE,
+    USE_RPCC,
     WHITE_INDEX,
 )
 
@@ -205,16 +205,18 @@ def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defau
              "the fit; higher = smoother hue transitions, 0 disables (analyze only).",
     )
     parser.add_argument(
-        "--perform-nonlinear-corrections",
+        "--use-hppcc",
         action=argparse.BooleanOptionalAction,
-        default=PERFORM_NONLINEAR_CORRECTIONS if use_defaults else None,
-        help="If set, fits HPPCC+RPCC (nonlinear residual). Otherwise, uses HPPCC only.",
+        default=USE_HPPCC if use_defaults else None,
+        help="Enable Hue-Plane Preserving Color Correction (HPPCC). "
+             "--no-use-hppcc applies the linear baseline only.",
     )
     parser.add_argument(
-        "--simple-linear",
+        "--use-rpcc",
         action=argparse.BooleanOptionalAction,
-        default=SIMPLE_LINEAR if use_defaults else None,
-        help="Use only the white-preserving 3x3 linear model, skipping HPPCC entirely.",
+        default=USE_RPCC if use_defaults else None,
+        help="Enable Root-Polynomial residual stage on top of HPPCC (HPPCC+RPCC). "
+             "Has no effect when --no-use-hppcc is set.",
     )
     parser.add_argument(
         "--hppcc-gradient",

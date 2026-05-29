@@ -1,4 +1,4 @@
-"""White-preserving linear, RPCC, and HPPCC models."""
+"""White-preserving linear, RPCC, HPPCC, HLCC, TPS, and LWCC models."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from itertools import combinations
 
 import numpy as np
 
-from .config import HPPCC_GRADIENT_SMOOTH_SIGMA, HPPCC_REGION_SMOOTHNESS
-from .metrics import hue_angle_from_rgb
+from .config import HPPCC_GRADIENT_SMOOTH_SIGMA, HPPCC_REGION_SMOOTHNESS, HLCC_SECTORS, RPCC_RIDGE_LAMBDA
+from .metrics import hue_angle_from_rgb, delta_e_2000, xyz_to_lab
 
 
 def _solve_constrained_least_squares(a: np.ndarray, x: np.ndarray, c: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -83,30 +83,31 @@ class HPPCCModel:
         if k_regions < 2:
             return self.predict(rgb)
 
-        full_boundaries = np.concatenate([boundaries, [2.0 * np.pi]])
-        centers = np.empty(k_regions, dtype=np.float64)
-        for region in range(k_regions):
-            start = full_boundaries[region]
-            end = full_boundaries[region + 1]
-            centers[region] = start + 0.5 * (end - start)
+        # searchsorted(boundaries, angle, 'right') % k assigns:
+        #   region 0  → angles in [boundaries[k-1], 2π)
+        #   region i  → angles in [boundaries[i-1], boundaries[i])  for i ≥ 1
+        # so each Gaussian centre must sit at the midpoint of the ACTUAL range of
+        # its region, not the interval [boundaries[i], boundaries[i+1]) which is
+        # off by one.
+        starts = np.concatenate([[boundaries[-1]], boundaries[:-1]])
+        ends = np.concatenate([[2.0 * np.pi], boundaries[1:]])
+        centers = starts + 0.5 * (ends - starts)
+        widths = ends - starts  # actual angular width of each region
 
         # Gaussian partition of unity over hue angle. Each region's matrix is
         # weighted by a Gaussian of the angular distance from its centre, then
         # the weights are normalised. A Gaussian is positive everywhere, so
         # adjacent regions always overlap and the blend crosses every region
         # boundary smoothly (C-infinity) — no hard region assignment, no
-        # two-tone seam. The earlier triangular kernel had compact support
-        # scaled by region width: near a boundary every weight could clip to
-        # zero, forcing a hard fallback and a visible discontinuity (badly so
-        # for narrow regions). `blend_width` scales sigma relative to the mean
-        # region width (2*pi / k): larger = softer transition.
+        # two-tone seam. sigma is scaled by each region's ACTUAL width (not
+        # the mean width), so narrow regions stay tight while wide regions
+        # blend more broadly — preventing narrow-region matrices from
+        # contaminating predictions that belong to adjacent wide regions.
         if np.isscalar(blend_width):
             blend_fraction = float(blend_width)
             if blend_fraction <= 0.0:
                 return self.predict(rgb)
-            sigmas = np.full(
-                k_regions, blend_fraction * (2.0 * np.pi / k_regions), dtype=np.float64
-            )
+            sigmas = blend_fraction * widths
         else:
             sigmas = np.asarray(blend_width, dtype=np.float64)
             if sigmas.shape != (k_regions,):
@@ -558,4 +559,389 @@ def fit_hppcc_gradient(
         coeffs=w.reshape(n_basis, 3, 3),
         white_rgb=white_rgb.copy(),
         white_xyz=white_xyz.copy(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ridge-regularised RPCC
+# ---------------------------------------------------------------------------
+
+def fit_rpcc_ridge(
+    rgb: np.ndarray,
+    xyz: np.ndarray,
+    white_index: int,
+    lambda_ridge: float = RPCC_RIDGE_LAMBDA,
+) -> RPCCModel:
+    """Fit a Tikhonov-regularised Root-Polynomial CC matrix (6×3).
+
+    Minimises  ||F M - XYZ||² + λ ||M||²  subject to F_white M = XYZ_white.
+    Ridge shrinks the polynomial coefficients toward zero, reducing overfitting
+    when the training set is small.  λ=0 is equivalent to fit_rpcc.
+
+    Reference: Cheung et al. (2004), Coloration Technology 120(1):19-25.
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    features = _rpcc_features(rgb)
+    white_features = features[white_index]
+    white_xyz = xyz[white_index].copy()
+    # Augment the design matrix: appending sqrt(λ)*I adds the Tikhonov penalty
+    # as extra "virtual" observations with target 0.
+    a_aug = np.vstack([features, np.sqrt(lambda_ridge) * np.eye(features.shape[1])])
+    y_aug = np.vstack([xyz, np.zeros((features.shape[1], 3), dtype=np.float64)])
+    matrix = _solve_constrained_least_squares(
+        a_aug, y_aug, white_features[np.newaxis, :], white_xyz[np.newaxis, :]
+    )
+    return RPCCModel(matrix=matrix, white_rgb=rgb[white_index].copy(), white_xyz=white_xyz)
+
+
+# ---------------------------------------------------------------------------
+# HLCC — Hue-Linear Color Correction
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class HLCCModel:
+    """Hue-Linear Color Correction (Kawakami-style hat-function interpolation).
+
+    The correction matrix M(θ) is a piecewise-linear (hat-function) blend of
+    K sector matrices placed at equal hue-angle intervals θ_k = k·2π/K.
+    For a pixel whose sensor hue falls in the interval [θ_i, θ_{i+1}):
+
+        M(θ) = (1−t)·M_i  +  t·M_{(i+1) mod K}
+
+    where t = (θ − θ_i) / (2π/K) ∈ [0,1).
+
+    Because the hat functions form a partition of unity (they sum to 1 for all
+    θ) and each M_k maps white_rgb → white_xyz, M(θ) automatically preserves
+    the white point for every hue angle.
+
+    Reference: Kawakami et al. (hue-linear interpolation); see also
+    Finlayson & Hordley (HPPCC, 2001).
+    """
+
+    matrices: np.ndarray  # (K, 3, 3)
+    white_rgb: np.ndarray
+    white_xyz: np.ndarray
+
+    @property
+    def n_sectors(self) -> int:
+        return len(self.matrices)
+
+    def predict(self, rgb: np.ndarray, **_kwargs) -> np.ndarray:
+        rgb = np.asarray(rgb, dtype=np.float64)
+        flat = rgb.reshape(-1, 3)
+        angles = hue_angle_from_rgb(flat)
+        K = self.n_sectors
+        step = 2.0 * np.pi / K
+        frac = angles / step                     # fractional sector position
+        sector = np.floor(frac).astype(int) % K
+        t = (frac - np.floor(frac))[:, None]     # (N,1) interpolation weight
+        next_sector = (sector + 1) % K
+        out = (
+            (1.0 - t) * np.einsum("ij,ijk->ik", flat, self.matrices[sector])
+            + t * np.einsum("ij,ijk->ik", flat, self.matrices[next_sector])
+        )
+        return out.reshape(rgb.shape)
+
+    def predict_blending(self, rgb: np.ndarray, **_kwargs) -> np.ndarray:
+        return self.predict(rgb)
+
+    @property
+    def boundaries(self) -> np.ndarray:
+        K = self.n_sectors
+        return np.linspace(0.0, 2.0 * np.pi, K, endpoint=False)
+
+    @property
+    def matrices_as_3d(self) -> np.ndarray:
+        return np.asarray(self.matrices, dtype=np.float64)
+
+
+def fit_hlcc(
+    rgb: np.ndarray,
+    xyz: np.ndarray,
+    *,
+    white_index: int,
+    chromatic_indices: np.ndarray | list[int],
+    k_sectors: int = HLCC_SECTORS,
+) -> HLCCModel:
+    """Fit a Hue-Linear Color Correction model with K equal-width hue sectors.
+
+    Design matrix: for patch j at sensor hue θ_j in sector i with fractional
+    weight t, row j of A is zero except:
+        A[j, 3i:3(i+1)] = (1−t)·rgb_j
+        A[j, 3((i+1)%K):3((i+1)%K+1)] += t·rgb_j
+
+    White constraints: M_k·white_rgb = white_xyz for every sector k.
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    chromatic_indices = np.asarray(chromatic_indices, dtype=int)
+    q = rgb[chromatic_indices]
+    p = xyz[chromatic_indices]
+    white_rgb = rgb[white_index]
+    white_xyz = xyz[white_index]
+    N = len(q)
+    K = k_sectors
+    step = 2.0 * np.pi / K
+
+    angles = hue_angle_from_rgb(q)
+    frac = angles / step
+    sector = np.floor(frac).astype(int) % K
+    t = frac - np.floor(frac)
+    next_s = (sector + 1) % K
+
+    a = np.zeros((N, 3 * K), dtype=np.float64)
+    for j in range(N):
+        s, ns, tj = int(sector[j]), int(next_s[j]), float(t[j])
+        a[j, 3 * s : 3 * (s + 1)] += (1.0 - tj) * q[j]
+        a[j, 3 * ns : 3 * (ns + 1)] += tj * q[j]
+
+    # White constraints: one per sector
+    c = np.zeros((K, 3 * K), dtype=np.float64)
+    b = np.zeros((K, 3), dtype=np.float64)
+    for k in range(K):
+        c[k, 3 * k : 3 * (k + 1)] = white_rgb
+        b[k] = white_xyz
+
+    w = _solve_constrained_least_squares(a, p, c, b)  # (3K, 3)
+    return HLCCModel(
+        matrices=w.reshape(K, 3, 3),
+        white_rgb=white_rgb.copy(),
+        white_xyz=white_xyz.copy(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# TPS — Thin-Plate Spline Color Correction
+# ---------------------------------------------------------------------------
+
+class TPSModel:
+    """Thin-Plate Spline color correction.
+
+    Maps camera RGB → XYZ by fitting a TPS through the N training patch pairs.
+    The TPS minimises the second-derivative bending energy while interpolating
+    (or approximating with smoothing>0) the training points exactly.  It
+    extrapolates smoothly but may diverge far from the training hull.
+
+    Training data is stored for re-fitting on deserialisation; the scipy
+    RBFInterpolator is built lazily and cached.
+
+    Reference: Bookstein (1989), IEEE TPAMI 11(6):567-585;
+               Fang et al. (2019), AIP Advances 9(12):125134.
+    """
+
+    def __init__(
+        self,
+        training_rgb: np.ndarray,
+        training_xyz: np.ndarray,
+        white_rgb: np.ndarray,
+        white_xyz: np.ndarray,
+        smoothing: float = 0.0,
+    ) -> None:
+        self.training_rgb = np.asarray(training_rgb, dtype=np.float64)
+        self.training_xyz = np.asarray(training_xyz, dtype=np.float64)
+        self.white_rgb = np.asarray(white_rgb, dtype=np.float64)
+        self.white_xyz = np.asarray(white_xyz, dtype=np.float64)
+        self.smoothing = float(smoothing)
+        self._interp = None
+
+    def _get_interp(self):
+        if self._interp is None:
+            from scipy.interpolate import RBFInterpolator
+            self._interp = RBFInterpolator(
+                self.training_rgb,
+                self.training_xyz,
+                kernel="thin_plate_spline",
+                smoothing=self.smoothing,
+            )
+        return self._interp
+
+    def predict(self, rgb: np.ndarray, **_kwargs) -> np.ndarray:
+        rgb = np.asarray(rgb, dtype=np.float64)
+        flat = rgb.reshape(-1, 3)
+        out = self._get_interp()(flat)
+        return out.reshape(rgb.shape)
+
+    def predict_blending(self, rgb: np.ndarray, **_kwargs) -> np.ndarray:
+        return self.predict(rgb)
+
+
+def fit_tps(
+    rgb: np.ndarray,
+    xyz: np.ndarray,
+    white_index: int,
+    smoothing: float = 0.0,
+) -> TPSModel:
+    """Fit a Thin-Plate Spline from camera RGB to XYZ over the N training patches."""
+    rgb = np.asarray(rgb, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    return TPSModel(
+        training_rgb=rgb.copy(),
+        training_xyz=xyz.copy(),
+        white_rgb=rgb[white_index].copy(),
+        white_xyz=xyz[white_index].copy(),
+        smoothing=smoothing,
+    )
+
+
+# ---------------------------------------------------------------------------
+# LWCC — Locally Weighted Color Correction
+# ---------------------------------------------------------------------------
+
+class LWCCModel:
+    """Locally Weighted Color Correction.
+
+    For each training patch i a local 3×3 matrix M_i is fitted from all N
+    training patches with Gaussian distance-weighting centred on patch i.
+    For any test pixel x the prediction blends the N local matrices by
+    Gaussian weights in RGB space:
+
+        M(x) = Σ_i w_i(x)·M_i / Σ_i w_i(x),   y = M(x)·x
+
+    Processing is chunked to stay within a configurable memory budget.
+
+    References: locally-weighted / nearest-neighbour colour correction methods
+    surveyed in Cheung et al. (2004).
+    """
+
+    def __init__(
+        self,
+        local_matrices: np.ndarray,
+        training_rgb: np.ndarray,
+        bandwidth: float,
+        white_rgb: np.ndarray,
+        white_xyz: np.ndarray,
+        chunk_size: int = 100_000,
+    ) -> None:
+        self.local_matrices = np.asarray(local_matrices, dtype=np.float64)
+        self.training_rgb = np.asarray(training_rgb, dtype=np.float64)
+        self.bandwidth = float(bandwidth)
+        self.white_rgb = np.asarray(white_rgb, dtype=np.float64)
+        self.white_xyz = np.asarray(white_xyz, dtype=np.float64)
+        self.chunk_size = int(chunk_size)
+
+    def predict(self, rgb: np.ndarray, **_kwargs) -> np.ndarray:
+        rgb = np.asarray(rgb, dtype=np.float64)
+        flat = rgb.reshape(-1, 3)
+        N_train = len(self.training_rgb)
+        h2 = self.bandwidth ** 2
+        out = np.empty_like(flat)
+        cs = self.chunk_size
+        for start in range(0, len(flat), cs):
+            chunk = flat[start : start + cs]              # (C, 3)
+            diff = chunk[:, None, :] - self.training_rgb[None, :, :]  # (C, N, 3)
+            sq_dist = np.einsum("cni,cni->cn", diff, diff)            # (C, N)
+            w = np.exp(-0.5 * sq_dist / h2)                           # (C, N)
+            w /= w.sum(axis=1, keepdims=True).clip(1e-12)
+            # Blended matrix per pixel: (C, 3, 3)
+            blended = np.einsum("cn,nij->cij", w, self.local_matrices)
+            out[start : start + cs] = np.einsum("ci,cij->cj", chunk, blended)
+        return out.reshape(rgb.shape)
+
+    def predict_blending(self, rgb: np.ndarray, **_kwargs) -> np.ndarray:
+        return self.predict(rgb)
+
+
+def fit_lwcc(
+    rgb: np.ndarray,
+    xyz: np.ndarray,
+    white_index: int,
+    bandwidth: float | None = None,
+) -> LWCCModel:
+    """Fit a Locally Weighted Color Correction model.
+
+    For each training patch i, a local 3×3 matrix M_i is solved from all N
+    patches weighted by  w_ij = exp(−||rgb_i − rgb_j||² / (2·h²))  subject
+    to the white-point constraint  M_i·white_rgb = white_xyz.
+
+    Bandwidth h defaults to half the median pairwise Euclidean distance in the
+    normalised RGB training set (a data-driven Silverman-like rule).
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    N = len(rgb)
+    white_rgb = rgb[white_index]
+    white_xyz = xyz[white_index]
+
+    if bandwidth is None:
+        from scipy.spatial.distance import pdist
+        dists = pdist(rgb)
+        bandwidth = float(np.median(dists)) * 0.5 if len(dists) > 0 else 1.0
+        bandwidth = max(bandwidth, 1e-6)
+
+    h2 = bandwidth ** 2
+    local_matrices = np.empty((N, 3, 3), dtype=np.float64)
+    c = white_rgb[np.newaxis, :]        # (1, 3)
+    b = white_xyz[np.newaxis, :]        # (1, 3)
+    for i in range(N):
+        sq = np.sum((rgb - rgb[i]) ** 2, axis=1)
+        w_vec = np.exp(-0.5 * sq / h2)
+        # sqrt-weight augmentation so _solve_constrained_least_squares sees ||Ax-b||²
+        sw = np.sqrt(w_vec)[:, None]           # (N, 1)
+        local_matrices[i] = _solve_constrained_least_squares(
+            rgb * sw, xyz * sw, c, b
+        )
+
+    return LWCCModel(
+        local_matrices=local_matrices,
+        training_rgb=rgb.copy(),
+        bandwidth=bandwidth,
+        white_rgb=white_rgb.copy(),
+        white_xyz=white_xyz.copy(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# CIEDE2000-optimised linear model
+# ---------------------------------------------------------------------------
+
+def fit_de00_opt(
+    rgb: np.ndarray,
+    xyz: np.ndarray,
+    white_index: int,
+    illuminant_white: np.ndarray,
+) -> LinearWhitePreservingModel:
+    """Fit a 3×3 linear model by minimising the sum of CIEDE2000 errors.
+
+    Starts from the white-preserving OLS solution; refines with scipy SLSQP
+    using the dE00 sum as the loss function.  The white-point equality
+    constraint is enforced exactly throughout the optimisation.
+
+    Reference: Luo et al. (2001), Color Research & Application 26(5):340-355.
+    """
+    from scipy.optimize import minimize
+
+    rgb = np.asarray(rgb, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    illuminant_white = np.asarray(illuminant_white, dtype=np.float64)
+    white_rgb = rgb[white_index]
+    white_xyz = xyz[white_index].copy()
+
+    lab_ref = xyz_to_lab(xyz, illuminant_white)
+
+    linear0 = fit_white_preserving_3x3(rgb, xyz, white_index)
+    m0 = linear0.matrix.ravel()
+
+    def loss(m_flat: np.ndarray) -> float:
+        M = m_flat.reshape(3, 3)
+        xyz_pred = rgb @ M
+        lab_pred = xyz_to_lab(xyz_pred, illuminant_white)
+        de = delta_e_2000(lab_pred, lab_ref)
+        return float(np.sum(de))
+
+    def white_con(m_flat: np.ndarray) -> np.ndarray:
+        return white_rgb @ m_flat.reshape(3, 3) - white_xyz
+
+    result = minimize(
+        loss,
+        m0,
+        method="SLSQP",
+        constraints={"type": "eq", "fun": white_con},
+        options={"maxiter": 2000, "ftol": 1e-10},
+    )
+    M_opt = result.x.reshape(3, 3)
+    return LinearWhitePreservingModel(
+        matrix=M_opt,
+        white_rgb=white_rgb.copy(),
+        white_xyz=white_xyz,
     )
