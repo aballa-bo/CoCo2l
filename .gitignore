@@ -38,6 +38,10 @@ exiftool_files/
 # Output / generated artifacts
 output/
 out/
+out2/
+
+# JVM crash logs (from bundled native tools)
+hs_err_pid*.log
 
 # OS
 .DS_Store
