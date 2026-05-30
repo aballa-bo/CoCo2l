@@ -1,11 +1,14 @@
 name: Release
 
-# Builds the PyInstaller bundle and publishes it as a GitHub Release.
+# Builds the PyInstaller bundle for Windows, Linux and macOS and publishes them
+# as a single GitHub Release.
 #
 # Trigger options:
-#   - Push a tag matching `v*` (e.g. `git tag v0.2 && git push --tags`).
+#   - Push a tag matching `v*` (e.g. `git tag v0.2.8 && git push origin v0.2.8`).
 #     The tag name becomes the release name and is treated as the version.
 #   - Manually from the Actions tab via "Run workflow", entering the tag name.
+#
+# Note: PyInstaller cannot cross-compile, so each OS is built on its own runner.
 on:
   push:
     tags:
@@ -13,16 +16,23 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag name (e.g. v0.2). A tag with this name will be created on the current commit if it does not exist.'
+        description: 'Tag name (e.g. v0.2.8). Created on the current commit if it does not exist.'
         required: true
 
 permissions:
   contents: write   # needed to create the release and upload assets
 
 jobs:
-  build-windows:
-    name: Build & release (Windows)
-    runs-on: windows-latest
+  build:
+    name: Build (${{ matrix.os_name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, os_name: windows, archive: zip }
+          - { runner: ubuntu-latest,  os_name: linux,   archive: tar }
+          - { runner: macos-latest,   os_name: macos,   archive: tar }   # Apple Silicon (arm64)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,13 +43,23 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Install system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblensfun-dev libgl1 libegl1 libxcb-cursor0
+
+      - name: Install system libraries (macOS)
+        if: runner.os == 'macOS'
+        run: brew install lensfun
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller==6.20.0
 
-      - name: Determine tag
+      - name: Determine names
         id: meta
         shell: bash
         run: |
@@ -48,19 +68,56 @@ jobs:
           else
             TAG="${GITHUB_REF#refs/tags/}"
           fi
+          EXT=zip
+          [ "${{ matrix.archive }}" = "tar" ] && EXT=tar.gz
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "zip=coco2-${TAG}-windows.zip" >> "$GITHUB_OUTPUT"
+          echo "asset=coco2-${TAG}-${{ matrix.os_name }}.${EXT}" >> "$GITHUB_OUTPUT"
 
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm --clean coco2.spec
 
-      - name: Package dist as zip
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $zip = "${{ steps.meta.outputs.zip }}"
-          Compress-Archive -Path dist/coco2/* -DestinationPath $zip -Force
-          Write-Host "Created $zip"
-          Get-Item $zip | Select-Object Name, Length
+          $asset = "${{ steps.meta.outputs.asset }}"
+          Compress-Archive -Path dist/coco2/* -DestinationPath $asset -Force
+          Get-Item $asset | Select-Object Name, Length
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        # tar (not zip) so the Unix executable bit on the `coco2` binary is kept.
+        run: |
+          tar -czf "${{ steps.meta.outputs.asset }}" -C dist coco2
+          ls -l "${{ steps.meta.outputs.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coco2-${{ matrix.os_name }}
+          path: ${{ steps.meta.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
@@ -68,18 +125,25 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: coco2 ${{ steps.meta.outputs.tag }}
           generate_release_notes: true
-          files: ${{ steps.meta.outputs.zip }}
+          files: artifacts/*
           body: |
+            ## Downloads
+            - **Windows:** `coco2-${{ steps.meta.outputs.tag }}-windows.zip`
+            - **Linux:** `coco2-${{ steps.meta.outputs.tag }}-linux.tar.gz`
+            - **macOS (Apple Silicon):** `coco2-${{ steps.meta.outputs.tag }}-macos.tar.gz`
+
             ## Installation
+            1. Download and extract the archive for your OS.
+            2. Install **ExifTool** (<https://exiftool.org/>) and put it on your
+               PATH, or beside the `coco2` binary (Windows: `exiftool.exe` plus the
+               `exiftool_files/` folder).
+            3. Run `coco2` (`coco2.exe` on Windows).
 
-            1. Download `${{ steps.meta.outputs.zip }}` and extract it.
-            2. Download ExifTool (Windows Executable) from <https://exiftool.org/>.
-               Place `exiftool.exe` and the `exiftool_files/` folder **next to
-               `coco2.exe`** inside the extracted folder.
-            3. Run `coco2.exe`.
+            ExifTool is not bundled for licensing/freshness reasons; the app falls
+            back to a system PATH lookup and an optional `config.ini` override
+            (see README).
 
-            ExifTool is not bundled with the release for licensing/freshness
-            reasons; the application falls back to a system PATH lookup and an
-            optional `config.ini` override (see README).
+            > The macOS build is unsigned: on first launch use right-click → Open,
+            > or run `xattr -dr com.apple.quarantine coco2` on the extracted folder.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

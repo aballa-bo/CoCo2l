@@ -5,6 +5,7 @@
 # Note: ExifTool is NOT bundled. After building, copy `exiftool.exe` and
 # `exiftool_files/` next to dist/coco2/coco2.exe (same rule as dev mode).
 
+import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(SPECPATH).resolve()
@@ -47,19 +48,23 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data)
 
-splash = Splash(
-    str(PROJECT_ROOT / 'assets' / 'cocoico1.png'),
-    binaries=a.binaries,
-    datas=a.datas,
-    text_pos=None,             # no progress text — just the artwork
-    always_on_top=True,
-    minify_script=True,
-)
+# PyInstaller's Splash screen is supported only on Windows and Linux — skip it
+# on macOS, where Splash() would abort the build.
+splash = None
+if sys.platform != 'darwin':
+    splash = Splash(
+        str(PROJECT_ROOT / 'assets' / 'cocoico1.png'),
+        binaries=a.binaries,
+        datas=a.datas,
+        text_pos=None,             # no progress text — just the artwork
+        always_on_top=True,
+        minify_script=True,
+    )
 
 exe = EXE(
     pyz,
     a.scripts,
-    splash,                    # splash launcher embedded in the exe (onedir mode)
+    *([splash] if splash else []),   # splash launcher embedded in the exe (onedir mode)
     [],
     exclude_binaries=True,
     name='coco2',
@@ -69,7 +74,8 @@ exe = EXE(
     upx=False,
     console=False,             # GUI app; subprocess stdout is captured via QProcess pipes
     disable_windowed_traceback=False,
-    icon=str(PROJECT_ROOT / 'assets' / 'cocoicobn.ico'),
+    # .ico is Windows-only; macOS wants .icns and Linux ignores the icon.
+    icon=str(PROJECT_ROOT / 'assets' / 'cocoicobn.ico') if sys.platform == 'win32' else None,
 )
 
 coll = COLLECT(
@@ -77,7 +83,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    splash.binaries,           # splash native DLL goes in dist next to the exe
+    *([splash.binaries] if splash else []),   # splash native lib next to the exe
     strip=False,
     upx=False,
     name='coco2',

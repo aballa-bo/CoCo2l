@@ -5,10 +5,12 @@ images, built around a **visual processing pipeline**: you assemble an ordered
 sequence of preprocessing and color-correction operations, tune each one, and run
 it against an X-Rite ColorChecker Classic 24.
 
+
 A range of correction models is available as interchangeable building blocks —
 linear and locally-linear (baseline 3×3, Wiener, PCA, ΔE00-optimised, HPPCC,
 HLCC, LWCC) and non-linear (RPCC, ridge-RPCC, HPPCC+RPCC, thin-plate spline) —
 none privileged over the others; you choose which to apply.
+
 
 ## Features
 
@@ -63,23 +65,27 @@ pip install -r requirements.txt
 ### 2. ExifTool (required to copy EXIF from RAW to developed images)
 
 ExifTool is **not bundled with the repository** (it is an external, separately
-distributed dependency). Download it from the official site and place it in the
-**project root folder** (the same folder that contains `coco2.py`):
+distributed dependency). Install it for your platform:
 
-1. Download the "Windows Executable" from <https://exiftool.org/>.
-2. Extract the archive and copy into the project root:
-   - `exiftool(-k).exe` → rename to **`exiftool.exe`**
-   - The **`exiftool_files/`** folder (required by recent distributions — it contains
-     `perl5*.dll` and the Perl modules ExifTool needs at runtime)
+**Windows** — download the "Windows Executable" from <https://exiftool.org/>,
+then place it in the **project root folder** (the folder containing `coco2.py`):
+- rename `exiftool(-k).exe` → **`exiftool.exe`**
+- also copy the **`exiftool_files/`** folder next to it (required by recent
+  distributions — it holds `perl5*.dll` and the Perl modules ExifTool needs at
+  runtime).
 
-The app resolves `exiftool` in this order:
+**macOS** — `brew install exiftool` (or download the macOS package from
+<https://exiftool.org/>). It lands on your `PATH` as `exiftool`.
 
-1. `<project_root>/exiftool.exe` (recommended).
+**Linux** — install from your package manager, e.g. `sudo apt install
+libimage-exiftool-perl` (Debian/Ubuntu) or `sudo dnf install perl-Image-ExifTool`
+(Fedora). It lands on your `PATH` as `exiftool`.
+
+The app resolves ExifTool in this order:
+
+1. `<project_root>/exiftool.exe` (Windows) or `<project_root>/exiftool` (macOS/Linux).
 2. Path declared in `config.ini` (see below).
-3. System `PATH` (generic `exiftool` lookup).
-
-On macOS / Linux: use the name without extension (`exiftool`), or install it via your
-package manager and let `PATH` resolve it.
+3. System `PATH` (generic `exiftool` lookup) — the usual case on macOS/Linux.
 
 ### 3. Optional path override: `config.ini`
 
