@@ -579,7 +579,7 @@ class DenoiseSettingsDialog(QDialog):
         form.setSpacing(8)
 
         self._method = QComboBox()
-        self._method.addItems(["wavelet", "bilateral"])
+        self._method.addItems(["wavelet", "bilateral", "adaptive_bilateral"])
         self._method.setCurrentText(cfg.get("method", "wavelet"))
         form.addRow("Method:", self._method)
 
@@ -722,6 +722,76 @@ class HPPCCSettingsDialog(QDialog):
         }
 
 
+class DevignettingSettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Devignetting settings")
+        self.setMinimumWidth(360)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._method = QComboBox()
+        self._method.addItems(["zheng", "goldman", "kim"])
+        self._method.setCurrentText(cfg.get("method", "zheng"))
+        self._method.setToolTip(
+            "zheng: Zheng et al. (2009), radial consistency (Default)\n"
+            "goldman: Goldman (2010), gradient distribution symmetry\n"
+            "kim: Kim & Pollefeys (2008), radiometric calibration"
+        )
+        form.addRow("Method:", self._method)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(buttons)
+
+    def get_settings(self) -> dict:
+        return {
+            "method": self._method.currentText(),
+        }
+
+
+class UndistortSettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Undistort settings")
+        self.setMinimumWidth(360)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._method = QComboBox()
+        self._method.addItems(["lensfun", "devernay", "aleman"])
+        self._method.setCurrentText(cfg.get("method", "lensfun"))
+        self._method.setToolTip(
+            "lensfun: Use Lensfun database (Default)\n"
+            "devernay: Devernay and Faugeras (2001)\n"
+            "aleman: Aleman-Flores et al. (2014)"
+        )
+        form.addRow("Method:", self._method)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(buttons)
+
+    def get_settings(self) -> dict:
+        return {
+            "method": self._method.currentText(),
+        }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Help — How to (renders README.md) and About dialogs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -823,6 +893,8 @@ class AnalyzeTab(QWidget):
         self.denoise_args_provider: callable = lambda: ["--no-patch-variance-denoise"]
         self.sharpen_args_provider: callable = lambda: ["--no-adaptive-sharpen"]
         self.hppcc_args_provider: callable = lambda: []
+        self.devignetting_args_provider: callable = lambda: ["--no-devignetting"]
+        self.undistort_args_provider: callable = lambda: ["--undistort"]
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -927,7 +999,7 @@ class AnalyzeTab(QWidget):
         white_row.addWidget(self._white_field_browse)
         p2.addLayout(white_row)
 
-        # Format / colorspace / algorithm options
+        # Format / colorspace / output method options
         opts = QHBoxLayout()
         opts.addWidget(QLabel("Format:"))
         self._fmt = QComboBox(); self._fmt.addItems(["jpeg", "tif", "png"])
@@ -937,27 +1009,36 @@ class AnalyzeTab(QWidget):
         self._cs = QComboBox(); self._cs.addItems(["sRGB", "Display-P3"])
         opts.addWidget(self._cs)
         opts.addSpacing(20)
-        self._use_hppcc = QCheckBox("HPPCC")
-        self._use_hppcc.setChecked(True)   # mirrors USE_HPPCC default
-        opts.addWidget(self._use_hppcc)
-        opts.addSpacing(8)
-        self._use_rpcc = QCheckBox("RPCC")
-        self._use_rpcc.setChecked(True)    # mirrors USE_RPCC default
-        opts.addWidget(self._use_rpcc)
-        opts.addSpacing(8)
-        self._hppcc_gradient = QCheckBox("HPPCC gradient")
-        self._hppcc_gradient.setChecked(False)
-        opts.addWidget(self._hppcc_gradient)
-        opts.addSpacing(12)
-        self._denoise = QCheckBox("Patch variance denoise")
-        self._denoise.setChecked(False)    # mirrors ENABLE_PATCH_VARIANCE_DENOISE default
-        opts.addWidget(self._denoise)
-        opts.addSpacing(12)
-        self._sharpen = QCheckBox("Adaptive sharpen")
-        self._sharpen.setChecked(False)    # mirrors ENABLE_ADAPTIVE_SHARPEN default
-        opts.addWidget(self._sharpen)
+        
+        apply_lbl = QLabel("<b>Apply to final image:</b>")
+        apply_lbl.setToolTip("Select which computed model should be used to render the final corrected image.")
+        opts.addWidget(apply_lbl)
+        self._output_method = QComboBox()
+        self._output_method.addItems([
+            "hppcc_rpcc", "hppcc", "baseline", "rpcc", "rpcc_ridge",
+            "hlcc", "tps", "lwcc", "de00_opt", "wiener", "pca"
+        ])
+        opts.addWidget(self._output_method)
         opts.addStretch()
         p2.addLayout(opts)
+
+        pre_row = QHBoxLayout()
+        pre_lbl = QLabel("<b>Pre-processing:</b>")
+        pre_row.addWidget(pre_lbl)
+        self._undistort = QCheckBox("Undistort")
+        self._undistort.setChecked(True)
+        pre_row.addWidget(self._undistort)
+        self._devignetting = QCheckBox("Devignetting")
+        self._devignetting.setChecked(False)
+        pre_row.addWidget(self._devignetting)
+        self._denoise = QCheckBox("Denoise")
+        self._denoise.setChecked(False)    # mirrors ENABLE_PATCH_VARIANCE_DENOISE default
+        pre_row.addWidget(self._denoise)
+        self._sharpen = QCheckBox("Sharpen")
+        self._sharpen.setChecked(False)    # mirrors ENABLE_ADAPTIVE_SHARPEN default
+        pre_row.addWidget(self._sharpen)
+        pre_row.addStretch()
+        p2.addLayout(pre_row)
 
         run_row = QHBoxLayout()
         run_row.setSpacing(8)
@@ -1044,10 +1125,6 @@ class AnalyzeTab(QWidget):
         if d:
             edit.setText(d)
 
-    def _on_simple_linear_toggled(self, checked: bool) -> None:
-        self._nonlinear.setEnabled(not checked)
-        self._hppcc_gradient.setEnabled(not checked)
-
     def _on_white_field_toggled(self, checked: bool) -> None:
         self._white_field_path.setEnabled(checked)
         self._white_field_browse.setEnabled(checked)
@@ -1088,41 +1165,48 @@ class AnalyzeTab(QWidget):
         self._run_btn.setEnabled(False)
         self._set_led_busy()
 
-        out = self._output_dir.text().strip() or str(PROJECT_ROOT / "output")
-        args = _cc_args(
-            "analyze",
-            "--cc-image", self._raw_path,
-            "--analysis-dir", out,
-            "--process-dir", out,
-            "--output-format", self._fmt.currentText(),
-            "--output-colorspace", self._cs.currentText(),
-            "--no-show-detection-preview",
-            "--no-show-developed-image-preview",
-        )
-        if self._simple_linear.isChecked():
-            args += ["--simple-linear", "--no-perform-nonlinear-corrections"]
-        elif self._nonlinear.isChecked():
-            args += ["--no-simple-linear", "--perform-nonlinear-corrections"]
-        else:
-            args += ["--no-simple-linear", "--no-perform-nonlinear-corrections"]
-        args += self.denoise_args_provider()
-        args += self.sharpen_args_provider()
-        args += self.hppcc_args_provider()
-        if self._white_field.isChecked():
-            args += [
-                "--process-white-field",
-                "--white-field-image", self._white_field_path.text().strip(),
-            ]
-        else:
-            args.append("--no-process-white-field")
-        if self._roi:
-            args += ["--roi", f"{self._roi[0]},{self._roi[1]},{self._roi[2]},{self._roi[3]}"]
+        try:
+            out = self._output_dir.text().strip() or str(PROJECT_ROOT / "output")
+            args = _cc_args(
+                "analyze",
+                "--cc-image", self._raw_path,
+                "--analysis-dir", out,
+                "--process-dir", out,
+                "--output-format", self._fmt.currentText(),
+                "--output-colorspace", self._cs.currentText(),
+                "--output-label", self._output_method.currentText(),
+                "--no-show-detection-preview",
+                "--no-show-developed-image-preview",
+            )
 
-        self._proc = QProcess(self)
-        self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self._proc.readyReadStandardOutput.connect(self._on_output)
-        self._proc.finished.connect(self._on_done)
-        self._proc.start(PYTHON, args)
+            args += self.denoise_args_provider()
+            args += self.sharpen_args_provider()
+            args += self.hppcc_args_provider()
+            args += self.devignetting_args_provider()
+            args += self.undistort_args_provider()
+            
+            if self._white_field.isChecked():
+                args += [
+                    "--process-white-field",
+                    "--white-field-image", self._white_field_path.text().strip(),
+                ]
+            else:
+                args.append("--no-process-white-field")
+            if self._roi:
+                args += ["--roi", f"{self._roi[0]},{self._roi[1]},{self._roi[2]},{self._roi[3]}"]
+
+            self._proc = QProcess(self)
+            self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            self._proc.readyReadStandardOutput.connect(self._on_output)
+            self._proc.finished.connect(self._on_done)
+            self._proc.start(PYTHON, args)
+        except Exception as e:
+            import traceback
+            err_msg = traceback.format_exc()
+            QMessageBox.critical(self, "GUI Crash", f"An internal GUI error occurred:\n\n{err_msg}")
+            self._run_btn.setEnabled(True)
+            self._set_led_idle()
+
 
     def _on_output(self) -> None:
         raw = self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
@@ -1430,6 +1514,8 @@ class BatchTab(QWidget):
         self.denoise_args_provider: callable = lambda: ["--no-patch-variance-denoise"]
         self.sharpen_args_provider: callable = lambda: ["--no-adaptive-sharpen"]
         self.hppcc_args_provider: callable = lambda: []
+        self.devignetting_args_provider: callable = lambda: ["--no-devignetting"]
+        self.undistort_args_provider: callable = lambda: ["--undistort"]
         self._build_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────
@@ -1744,6 +1830,8 @@ class BatchTab(QWidget):
         args += self.denoise_args_provider()
         args += self.sharpen_args_provider()
         args += self.hppcc_args_provider()
+        args += self.devignetting_args_provider()
+        args += self.undistort_args_provider()
 
         self._current_stage = "analyzing"
         self._current_correction = ""
@@ -1899,6 +1987,13 @@ class MainWindow(QMainWindow):
             "use_blending": True,
             "blend_width": 0.15,
             "region_smoothness": 0.0,
+            "gradient": False,
+        }
+        self._devignetting_cfg: dict = {
+            "method": "zheng",
+        }
+        self._undistort_cfg: dict = {
+            "method": "lensfun",
         }
 
         self._tabs = QTabWidget()
@@ -1918,9 +2013,13 @@ class MainWindow(QMainWindow):
         self._analyze.denoise_args_provider = self.get_denoise_args
         self._analyze.sharpen_args_provider = self.get_sharpen_args
         self._analyze.hppcc_args_provider = self.get_hppcc_args
+        self._analyze.devignetting_args_provider = self.get_devignetting_args
+        self._analyze.undistort_args_provider = self.get_undistort_args
         self._batch.denoise_args_provider = self.get_denoise_args
         self._batch.sharpen_args_provider = self.get_sharpen_args
         self._batch.hppcc_args_provider = self.get_hppcc_args
+        self._batch.devignetting_args_provider = self.get_devignetting_args
+        self._batch.undistort_args_provider = self.get_undistort_args
 
         self._build_menu()
         self.setCentralWidget(self._tabs)
@@ -1943,11 +2042,11 @@ class MainWindow(QMainWindow):
             "analyze.show_developed": a._show_developed,
             "analyze.format":         a._fmt,
             "analyze.colorspace":     a._cs,
-            "analyze.simple_linear":  a._simple_linear,
-            "analyze.nonlinear":      a._nonlinear,
-            "analyze.hppcc_gradient": a._hppcc_gradient,
+            "analyze.output_method":  a._output_method,
             "analyze.denoise":        a._denoise,
             "analyze.sharpen":        a._sharpen,
+            "analyze.devignetting":   a._devignetting,
+            "analyze.undistort":      a._undistort,
             "analyze.white_field":    a._white_field,
             "analyze.white_field_path": a._white_field_path,
             "process.correction":     p._corr_edit,
@@ -2041,6 +2140,38 @@ class MainWindow(QMainWindow):
 
         self._analyze._sharpen.toggled.connect(self._on_checkbox_sharpen_toggled)
 
+        devignetting_menu = mb.addMenu("Devignetting")
+
+        self._devignetting_action = QAction("Devignetting", self, checkable=True)
+        self._devignetting_action.setChecked(self._analyze._devignetting.isChecked())
+        self._devignetting_action.toggled.connect(self._on_menu_devignetting_toggled)
+        devignetting_menu.addAction(self._devignetting_action)
+
+        devignetting_settings_action = QAction("Settings...", self)
+        devignetting_settings_action.triggered.connect(self._open_devignetting_settings)
+        devignetting_menu.addAction(devignetting_settings_action)
+
+        self._analyze._devignetting.toggled.connect(self._on_checkbox_devignetting_toggled)
+
+        undistort_menu = mb.addMenu("Undistort")
+
+        self._undistort_action = QAction("Undistort", self, checkable=True)
+        self._undistort_action.setChecked(self._analyze._undistort.isChecked())
+        self._undistort_action.toggled.connect(self._on_menu_undistort_toggled)
+        undistort_menu.addAction(self._undistort_action)
+
+        self._check_lensfun_action = QAction("Check Lensfun DB", self)
+        self._check_lensfun_action.triggered.connect(self._check_lensfun_db)
+        self._check_lensfun_action.setEnabled(False)
+        undistort_menu.addAction(self._check_lensfun_action)
+
+        undistort_settings_action = QAction("Settings...", self)
+        undistort_settings_action.triggered.connect(self._open_undistort_settings)
+        undistort_menu.addAction(undistort_settings_action)
+
+        self._analyze._undistort.toggled.connect(self._on_checkbox_undistort_toggled)
+        self._analyze._raw_edit.textChanged.connect(self._update_lensfun_check_state)
+
         # Expanding spacer so the Help menu lands on the right edge of the bar.
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -2104,6 +2235,66 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self._hppcc_cfg.update(dlg.get_settings())
 
+    def _on_menu_devignetting_toggled(self, checked: bool) -> None:
+        self._analyze._devignetting.blockSignals(True)
+        self._analyze._devignetting.setChecked(checked)
+        self._analyze._devignetting.blockSignals(False)
+
+    def _on_checkbox_devignetting_toggled(self, checked: bool) -> None:
+        self._devignetting_action.blockSignals(True)
+        self._devignetting_action.setChecked(checked)
+        self._devignetting_action.blockSignals(False)
+
+    def _open_devignetting_settings(self) -> None:
+        dlg = DevignettingSettingsDialog(self._devignetting_cfg, self)
+        if dlg.exec():
+            self._devignetting_cfg = dlg.get_settings()
+
+    def _on_menu_undistort_toggled(self, checked: bool) -> None:
+        self._analyze._undistort.blockSignals(True)
+        self._analyze._undistort.setChecked(checked)
+        self._analyze._undistort.blockSignals(False)
+
+    def _on_checkbox_undistort_toggled(self, checked: bool) -> None:
+        self._undistort_action.blockSignals(True)
+        self._undistort_action.setChecked(checked)
+        self._undistort_action.blockSignals(False)
+
+    def _open_undistort_settings(self) -> None:
+        dlg = UndistortSettingsDialog(self._undistort_cfg, self)
+        if dlg.exec():
+            self._undistort_cfg = dlg.get_settings()
+
+    def _update_lensfun_check_state(self, path: str) -> None:
+        has_file = bool(path.strip()) and Path(path.strip()).is_file()
+        self._check_lensfun_action.setEnabled(has_file)
+
+    def _check_lensfun_db(self) -> None:
+        path = self._analyze._raw_edit.text().strip()
+        if not path or not Path(path).is_file():
+            QMessageBox.information(self, "Check Lensfun DB", "Please select a valid RAW image first.")
+            return
+        from src.lens import is_lens_in_db
+        found, msg = is_lens_in_db(Path(path))
+        title = "Lensfun DB - Found" if found else "Lensfun DB - Not Found"
+        QMessageBox.information(self, title, msg)
+
+    def get_undistort_args(self) -> list[str]:
+        if not self._analyze._undistort.isChecked():
+            return ["--no-undistort"]
+        return [
+            "--undistort",
+            "--undistort-method", self._undistort_cfg["method"],
+        ]
+
+    def get_devignetting_args(self) -> list[str]:
+        if not self._analyze._devignetting.isChecked():
+            return ["--no-devignetting"]
+        return [
+            "--devignetting",
+            "--devignetting-method", self._devignetting_cfg["method"],
+        ]
+
     def get_denoise_args(self) -> list[str]:
         if not self._analyze._denoise.isChecked():
             return ["--no-patch-variance-denoise"]
@@ -2139,7 +2330,7 @@ class MainWindow(QMainWindow):
             ]
         else:
             args += ["--no-use-hppcc-blending"]
-        if self._analyze._hppcc_gradient.isChecked():
+        if cfg.get("gradient", False):
             args.append("--hppcc-gradient")
         else:
             args.append("--no-hppcc-gradient")
@@ -2156,6 +2347,15 @@ class MainWindow(QMainWindow):
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point — GUI when run directly, CLI passthrough when args are given
 # ─────────────────────────────────────────────────────────────────────────────
+
+import traceback
+
+def global_exception_hook(exctype, value, tb):
+    with open("crash.log", "w") as f:
+        traceback.print_exception(exctype, value, tb, file=f)
+    sys.__excepthook__(exctype, value, tb)
+
+sys.excepthook = global_exception_hook
 
 def main() -> None:
     # Force UTF-8 on stdio so that error messages containing non-ASCII path

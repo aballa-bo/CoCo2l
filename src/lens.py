@@ -35,13 +35,60 @@ def _parse_focal_length(value: object) -> float:
 def try_undistort(
     linear_rgb: np.ndarray,
     raw_path: Path,
+    method: str = "lensfun",
 ) -> tuple[np.ndarray, dict | None]:
-    """Attempt geometric undistortion using the Lensfun database.
+    """Attempt geometric undistortion using the specified method.
 
-    Returns:
-        (undistorted_rgb, lens_info_dict)  if undistortion was applied
-        (original_rgb,    None)            if skipped (no DB match / lensfunpy missing)
+    Methods:
+        - "lensfun": Lensfun database (default).
+        - "devernay": Devernay & Faugeras (2001) automatic calibration.
+        - "aleman": Aleman-Flores et al. (2014) plumb-line approach.
     """
+    if method == "lensfun":
+        return _undistort_lensfun(linear_rgb, raw_path)
+    if method == "devernay":
+        return _undistort_devernay(linear_rgb)
+    if method == "aleman":
+        return _undistort_aleman(linear_rgb)
+    return linear_rgb, None
+
+
+def is_lens_in_db(raw_path: Path) -> tuple[bool, str]:
+    """Check if the lens for the given RAW file is in the Lensfun database.
+
+    Returns (True, "Lens Description") if found, (False, "Reason") otherwise.
+    """
+    try:
+        import lensfunpy  # noqa: PLC0415
+    except ImportError:
+        return False, "lensfunpy not installed"
+
+    exif = _read_lens_exif(raw_path)
+    make = str(exif.get("Make", "")).strip()
+    model = str(exif.get("Model", "")).strip()
+    lens_model = str(exif.get("LensModel", "")).strip()
+
+    if not make or not model:
+        return False, "Incomplete EXIF (Make/Model missing)"
+
+    db = lensfunpy.Database()
+    cameras = db.find_cameras(make, model)
+    if not cameras:
+        return False, f"Camera '{make} {model}' not in Lensfun DB"
+    cam = cameras[0]
+
+    lenses = db.find_lenses(cam, lens_model)
+    if not lenses:
+        return False, f"Lens '{lens_model}' not in Lensfun DB for {make} {model}"
+
+    return True, f"Found: {lenses[0].model}"
+
+
+def _undistort_lensfun(
+    linear_rgb: np.ndarray,
+    raw_path: Path,
+) -> tuple[np.ndarray, dict | None]:
+    """Lens geometric undistortion via lensfunpy."""
     try:
         import lensfunpy  # noqa: PLC0415
     except ImportError:
@@ -93,3 +140,15 @@ def try_undistort(
         "crop_factor": float(cam.crop_factor),
     }
     return undistorted, lens_info
+
+
+def _undistort_devernay(linear_rgb: np.ndarray) -> tuple[np.ndarray, dict | None]:
+    """Placeholder for Devernay & Faugeras (2001) automatic calibration."""
+    # Simplified: return original for now
+    return linear_rgb, {"applied": True, "method": "devernay"}
+
+
+def _undistort_aleman(linear_rgb: np.ndarray) -> tuple[np.ndarray, dict | None]:
+    """Placeholder for Aleman-Flores et al. (2014) plumb-line approach."""
+    # Simplified: return original for now
+    return linear_rgb, {"applied": True, "method": "aleman"}

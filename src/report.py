@@ -59,7 +59,7 @@ def save_json_grid_preview(output_dir: Path, make_json_grid_preview, measured_rg
 
 
 def save_detection_overlay_preview(output_dir: Path, make_scene_preview, detection) -> Path:
-    output_dir.mkdir(exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     preview = make_scene_preview(
         detection.scene_image,
         detection.quadrilateral,
@@ -424,6 +424,8 @@ def print_hppcc_candidate_report(
     # Collect all method keys that appear in any candidate's best dict
     _method_order = [
         ("baseline",    "baseline"),
+        ("wiener",      "wiener"),
+        ("pca",         "pca"),
         ("rpcc",        "rpcc"),
         ("rpcc_ridge",  "rpcc_ridge"),
         ("hppcc",       "hppcc"),
@@ -655,6 +657,8 @@ def save_analysis_text_report(
     # All available methods in display order
     _de00_methods = [
         ("baseline",    "baseline"),
+        ("wiener",      "wiener"),
+        ("pca",         "pca"),
         ("rpcc",        "rpcc"),
         ("rpcc_ridge",  "rpcc_ridge"),
         ("hppcc",       hppcc_label),
@@ -683,6 +687,8 @@ def save_analysis_text_report(
 
     _dc_methods = [
         ("baseline_chroma_error",    "baseline"),
+        ("wiener_chroma_error",      "wiener"),
+        ("pca_chroma_error",         "pca"),
         ("rpcc_chroma_error",        "rpcc"),
         ("rpcc_ridge_chroma_error",  "rpcc_ridge"),
         ("hppcc_chroma_error",       hppcc_label),

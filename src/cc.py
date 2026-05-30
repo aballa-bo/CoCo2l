@@ -32,8 +32,11 @@ from src.config import (
     DENOISE_DIAMETER,
     DENOISE_SIGMA_SPACE,
     DENOISE_STRENGTH,
+    DEVIGNETTING_METHOD,
     ENABLE_ADAPTIVE_SHARPEN,
+    ENABLE_DEVIGNETTING,
     ENABLE_PATCH_VARIANCE_DENOISE,
+    ENABLE_PROCESS_WHITE_FIELD,
     HPPCC_BLEND_WIDTH,
     HPPCC_REGION_CANDIDATES,
     IMAGE_DIR,
@@ -59,6 +62,7 @@ from src.config import (
     USE_RPCC,
     WHITE_INDEX,
 )
+from src.devignetting import apply_devignetting
 from src.report import (
     maybe_show_detection_preview,
     print_detection_summary,
@@ -155,6 +159,10 @@ PROCESS_SETTING_NAMES = (
     "sharpen_amount",
     "sharpen_radius",
     "sharpen_threshold",
+    "undistort",
+    "undistort_method",
+    "devignetting",
+    "devignetting_method",
     "use_metadata_rgb_xyz_baseline",
     "use_hppcc_blending",
     "hppcc_blend_width",
@@ -195,13 +203,18 @@ def run_analysis(args) -> None:
     reference_chroma = load_reference_chroma(args.reference_path)
 
     raw = src.load_image_linear_rgb(raw_path)
-    undistorted_rgb, undistort_info = try_undistort(raw.rgb, raw_path)
-    if undistort_info is not None:
-        raw = _dc_replace(raw, rgb=undistorted_rgb)
-        print(f"Lens undistortion applied: {undistort_info['lens_model']} "
-              f"@ {undistort_info['focal_length_mm']:.1f} mm")
-    else:
-        print("Lens undistortion skipped: camera/lens not found in Lensfun database.")
+
+    # ── Geometric undistortion ──────────────────────────────────────────
+    undistort_info = None
+    if bool(getattr(args, "undistort", True)):
+        method = getattr(args, "undistort_method", "lensfun")
+        undistorted_rgb, undistort_info = try_undistort(raw.rgb, raw_path, method=method)
+        if undistort_info:
+            raw = _dc_replace(raw, rgb=undistorted_rgb)
+            print(f"Lens undistortion applied ({method}): {undistort_info.get('lens_model', 'unspecified')} "
+                  f"@ {undistort_info.get('focal_length_mm', 0):.1f} mm")
+        else:
+            print(f"Lens undistortion skipped ({method}): camera/lens not found or algorithm failure.")
     detection = detect_and_orient_colorchecker(raw.rgb, white_index=args.white_index, roi=getattr(args, "roi", None))
     save_detection_overlay_preview(args.analysis_dir, make_scene_preview, detection)
     sensor_black_levels_rgb = reduce_cfa_values_to_rgb(raw.black_level_per_channel, raw.color_desc)
@@ -302,6 +315,10 @@ def run_analysis(args) -> None:
     )
     if white_field_params is not None:
         scene_linear_rgb = apply_white_field_correction(scene_linear_rgb, white_field_params)
+    if bool(getattr(args, "devignetting", False)):
+        method = getattr(args, "devignetting_method", "zheng")
+        print(f"Applying blind devignetting: {method}")
+        scene_linear_rgb = apply_devignetting(scene_linear_rgb, method=method)
     if args.patch_variance_denoise or args.adaptive_sharpen:
         noise_profile = estimate_noise_profile_from_patches(
             scene_linear_rgb,
@@ -429,6 +446,13 @@ def run_analysis(args) -> None:
             reliable_patch_indices=reliable_patch_indices,
             use_hppcc_gradient=use_hppcc_gradient,
             hppcc_gradient_harmonics=gradient_harmonics,
+            use_hlcc=bool(getattr(args, "use_hlcc", True)),
+            use_tps=bool(getattr(args, "use_tps", True)),
+            use_lwcc=bool(getattr(args, "use_lwcc", True)),
+            use_de00_opt=bool(getattr(args, "use_de00_opt", True)),
+            use_rpcc_ridge=bool(getattr(args, "use_rpcc_ridge", True)),
+            use_wiener=bool(getattr(args, "use_wiener", True)),
+            use_pca=bool(getattr(args, "use_pca", True)),
         )
         hppcc_candidate_results.append({"k": int(k_regions), "best": result})
 
@@ -524,25 +548,36 @@ def run_analysis(args) -> None:
             radius=float(args.sharpen_radius),
             threshold=float(args.sharpen_threshold),
         )
-    if not use_hppcc:
-        corrected_full_xyz = best["baseline"].predict(normalized_full_rgb)
-        output_label = "baseline"
-    elif use_rpcc and "hppcc_rpcc" in best:
+
+    # ── Model Selection ──
+    output_label = args.output_label
+    if output_label not in best:
+        # Fallback to the most robust method if the requested one is missing
+        if use_hppcc and use_rpcc and "hppcc_rpcc" in best:
+            output_label = "hppcc_rpcc"
+        elif use_hppcc and "hppcc" in best:
+            output_label = "hppcc"
+        else:
+            output_label = "baseline"
+
+    if output_label == "hppcc_rpcc":
         corrected_full_xyz = predict_hppcc_rpcc(
             best["hppcc_rpcc"],
             normalized_full_rgb,
             use_blending=args.use_hppcc_blending,
             blend_width=args.hppcc_blend_width,
         )
-        output_label = "hppcc_rpcc"
-    else:
+    elif output_label == "hppcc":
         corrected_full_xyz = predict_hppcc(
             best["hppcc"],
             normalized_full_rgb,
             use_blending=args.use_hppcc_blending,
             blend_width=args.hppcc_blend_width,
         )
-        output_label = "hppcc"
+    else:
+        # HLCC, TPS, LWCC, and linear models
+        corrected_full_xyz = best[output_label].predict(normalized_full_rgb)
+
     # Under-exposed chart: HPPCC/RPCC is unreliable everywhere, use the linear
     # baseline for the whole image. Otherwise keep HPPCC/RPCC but fade to the
     # linear baseline above the fitted tonal range, so out-of-range highlights
@@ -573,17 +608,23 @@ def run_analysis(args) -> None:
     except RuntimeError as exc:
         print(f"Warning: {exc}")
     print(f"Analysis image written to: {analysis_output_path}")
-    models_payload: dict[str, object] = {
-        "baseline": linear_model_to_dict(best["baseline"]),
-        "rpcc": rpcc_model_to_dict(best["rpcc"]),
-        "rpcc_ridge": rpcc_model_to_dict(best["rpcc_ridge"]),
-    }
-    if use_hppcc:
+    models_payload: dict[str, object] = {}
+    if "baseline" in best:
+        models_payload["baseline"] = linear_model_to_dict(best["baseline"])
+    if "rpcc" in best:
+        models_payload["rpcc"] = rpcc_model_to_dict(best["rpcc"])
+    if "rpcc_ridge" in best:
+        models_payload["rpcc_ridge"] = rpcc_model_to_dict(best["rpcc_ridge"])
+    if "wiener" in best:
+        models_payload["wiener"] = linear_model_to_dict(best["wiener"])
+    if "pca" in best:
+        models_payload["pca"] = linear_model_to_dict(best["pca"])
+    if "hppcc" in best:
         models_payload["hppcc"] = hppcc_model_to_dict(best["hppcc"])
-        if use_rpcc and "hppcc_rpcc" in best:
-            models_payload["hppcc_rpcc"] = hppcc_rpcc_model_to_dict(best["hppcc_rpcc"])
-        if "hlcc" in best:
-            models_payload["hlcc"] = hlcc_model_to_dict(best["hlcc"])
+    if "hppcc_rpcc" in best:
+        models_payload["hppcc_rpcc"] = hppcc_rpcc_model_to_dict(best["hppcc_rpcc"])
+    if "hlcc" in best:
+        models_payload["hlcc"] = hlcc_model_to_dict(best["hlcc"])
     if "tps" in best:
         models_payload["tps"] = tps_model_to_dict(best["tps"])
     if "lwcc" in best:
@@ -833,6 +874,9 @@ def _process_single_raw(
     white_field_params = settings.get("white_field")
     if white_field_params:
         normalized_full_rgb = apply_white_field_correction(normalized_full_rgb, white_field_params)
+    if bool(settings.get("devignetting", False)):
+        method = str(settings.get("devignetting_method", "zheng"))
+        normalized_full_rgb = apply_devignetting(normalized_full_rgb, method=method)
     blown_highlight_weight = highlight_blowout_weight(normalized_full_rgb)
     normalized_full_rgb = desaturate_highlights(normalized_full_rgb)
     noise_profile = diagnostics.get("noise_profile")
@@ -887,6 +931,12 @@ def _process_single_raw(
         corrected_full_xyz = model.predict(normalized_full_rgb)
     elif output_label == "rpcc_ridge":
         model = rpcc_model_from_dict(models_payload["rpcc_ridge"])
+        corrected_full_xyz = model.predict(normalized_full_rgb)
+    elif output_label == "wiener":
+        model = linear_model_from_dict(models_payload["wiener"])
+        corrected_full_xyz = model.predict(normalized_full_rgb)
+    elif output_label == "pca":
+        model = linear_model_from_dict(models_payload["pca"])
         corrected_full_xyz = model.predict(normalized_full_rgb)
     elif output_label == "hppcc_rpcc":
         model = hppcc_rpcc_model_from_dict(models_payload["hppcc_rpcc"])

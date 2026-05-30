@@ -775,6 +775,26 @@ def _extract_patch_pixels(
     return np.asarray(image[top:bottom, left:right, :3], dtype=np.float64)
 
 
+def _fit_plane_and_get_residuals(patch: np.ndarray) -> np.ndarray:
+    """Fit a 2D plane to each channel of a patch to remove lighting gradients."""
+    h, w, c = patch.shape
+    y, x = np.indices((h, w))
+    y = y.ravel()
+    x = x.ravel()
+    # Design matrix for planar fit: [x, y, 1]
+    A = np.column_stack([x, y, np.ones_like(x)])
+    
+    residuals = np.zeros_like(patch)
+    for i in range(c):
+        channel_data = patch[..., i].ravel()
+        # Least squares plane fit
+        coeffs, _, _, _ = np.linalg.lstsq(A, channel_data, rcond=None)
+        plane = (A @ coeffs).reshape((h, w))
+        residuals[..., i] = patch[..., i] - plane
+        
+    return residuals
+
+
 def estimate_noise_profile_from_patches(
     normalized_image: np.ndarray,
     absolute_patch_centers: np.ndarray,
@@ -782,20 +802,39 @@ def estimate_noise_profile_from_patches(
     neutral_indices: np.ndarray,
     min_value: float = 0.01,
 ) -> dict[str, object]:
+    """Estimate a linear noise profile (variance = a*mean + b) from neutral patches.
+    
+    Uses planar fitting to remove lighting gradients across patches,
+    and RANSAC regression to ignore outliers (dust, scratches, specularities).
+    """
+    from sklearn.linear_model import RANSACRegressor
+
     neutral_indices = np.asarray(neutral_indices, dtype=int)
     patch_means = []
     patch_variances = []
     patch_payload = []
 
     for patch_index in neutral_indices:
-        patch = _extract_patch_pixels(normalized_image, absolute_patch_centers[patch_index], patch_size)
+        # Extract a slightly smaller ROI (30% reduction) to avoid edge blur
+        reduced_w = max(1, int(patch_size[0] * 0.7))
+        reduced_h = max(1, int(patch_size[1] * 0.7))
+        patch = _extract_patch_pixels(normalized_image, absolute_patch_centers[patch_index], (reduced_w, reduced_h))
+        
         if patch.size == 0:
             continue
-        pixels = patch.reshape(-1, 3)
-        mean_rgb = np.mean(pixels, axis=0)
+            
+        # Mean represents pure signal intensity
+        mean_rgb = np.mean(patch, axis=(0, 1))
+        
         if np.any(mean_rgb <= min_value) or np.any(mean_rgb >= 0.99):
             continue
-        variance_rgb = np.var(pixels, axis=0, ddof=1)
+            
+        # Remove lighting gradient before computing variance
+        residuals = _fit_plane_and_get_residuals(patch)
+        
+        # Variance represents noise energy
+        variance_rgb = np.var(residuals, axis=(0, 1), ddof=1)
+        
         patch_means.append(mean_rgb)
         patch_variances.append(variance_rgb)
         patch_payload.append(
@@ -806,20 +845,47 @@ def estimate_noise_profile_from_patches(
             }
         )
 
-    if not patch_means:
+    if len(patch_means) < 3:
+        # Fallback if we don't have enough points for regression
         sigma_rgb = np.array([0.003, 0.003, 0.003], dtype=np.float64)
         variance_rgb = sigma_rgb**2
         return {
-            "sigma_rgb": sigma_rgb.tolist(),
-            "variance_rgb": variance_rgb.tolist(),
+            "a": [0.0, 0.0, 0.0],
+            "b": variance_rgb.tolist(),
+            "sigma_rgb": sigma_rgb.tolist(), # Legacy key
+            "variance_rgb": variance_rgb.tolist(), # Legacy key
             "patch_count": 0,
             "patches": [],
         }
 
     means = np.asarray(patch_means, dtype=np.float64)
     variances = np.asarray(patch_variances, dtype=np.float64)
+    
+    a_coeffs = []
+    b_coeffs = []
+    
+    # Fit linear profile: variance = a * mean + b  for each channel
+    for i in range(3):
+        X = means[:, i].reshape(-1, 1)
+        y = variances[:, i]
+        
+        # RANSAC for robust outlier rejection
+        ransac = RANSACRegressor(min_samples=max(2, int(len(X)*0.6)), residual_threshold=None, random_state=42)
+        try:
+            ransac.fit(X, y)
+            a_coeffs.append(float(ransac.estimator_.coef_[0]))
+            b_coeffs.append(float(ransac.estimator_.intercept_))
+        except ValueError:
+            # Fallback if RANSAC fails
+            a_coeffs.append(0.0)
+            b_coeffs.append(np.median(y))
+
+    # Keep legacy median sigma for fallback/compatibility
     sigma_rgb = np.sqrt(np.median(np.clip(variances, 0.0, None), axis=0))
+    
     return {
+        "a": a_coeffs,
+        "b": b_coeffs,
         "sigma_rgb": sigma_rgb.tolist(),
         "variance_rgb": np.median(np.clip(variances, 0.0, None), axis=0).tolist(),
         "patch_count": int(len(patch_payload)),
@@ -930,6 +996,84 @@ def _denoise_channel_wavelet(
     return np.clip(approximation, 0.0, None)
 
 
+def denoise_linear_rgb_adaptive_bilateral(
+    normalized_image: np.ndarray,
+    noise_profile: dict[str, object],
+    *,
+    strength: float,
+    diameter: int,
+    sigma_space: float,
+) -> np.ndarray:
+    """Adaptive bilateral filter driven by a spatial noise map.
+    
+    Uses the RANSAC-fitted linear variance profile (sigma^2 = a*I + b)
+    to compute a per-pixel, per-channel noise map. The bilateral filter's
+    sigma_color is modulated locally by this noise map.
+    """
+    if diameter <= 0 or strength <= 0.0:
+        return np.asarray(normalized_image, dtype=np.float64).copy()
+
+    image = np.asarray(normalized_image, dtype=np.float64)
+    denoised = np.empty_like(image, dtype=np.float32)
+    
+    a_coeffs = noise_profile.get("a", [0.0, 0.0, 0.0])
+    b_coeffs = noise_profile.get("b", noise_profile.get("variance_rgb", [1e-5]*3))
+
+    for channel_index in range(3):
+        # 1. Generate spatial noise map: sigma_color(x,y) = sqrt(a*I(x,y) + b)
+        a = float(a_coeffs[channel_index])
+        b = float(b_coeffs[channel_index])
+        channel_data = image[..., channel_index].astype(np.float32)
+        
+        # Variance map (clip to avoid sqrt of negative values)
+        var_map = np.clip(a * channel_data + b, 1e-12, None)
+        sigma_map = np.sqrt(var_map) * float(strength)
+        
+        # 2. Adaptive bilateral filtering
+        # OpenCV's standard bilateral doesn't support a variable sigma_color map.
+        # We approximate it by blending multiple bilateral filters computed at 
+        # discrete noise levels (bins) to avoid writing a slow nested Python loop.
+        # For a truly exact implementation, we'd need a custom C++/Cython extension.
+        
+        min_sig = float(np.min(sigma_map))
+        max_sig = float(np.max(sigma_map))
+        num_bins = 5
+        
+        if max_sig - min_sig < 1e-4:
+            # Noise is uniform, fallback to standard bilateral
+            denoised[..., channel_index] = cv2.bilateralFilter(
+                channel_data,
+                d=int(diameter),
+                sigmaColor=max_sig,
+                sigmaSpace=float(sigma_space),
+            )
+            continue
+            
+        bins = np.linspace(min_sig, max_sig, num_bins)
+        filtered_layers = []
+        for sig in bins:
+            layer = cv2.bilateralFilter(
+                channel_data,
+                d=int(diameter),
+                sigmaColor=sig,
+                sigmaSpace=float(sigma_space),
+            )
+            filtered_layers.append(layer)
+            
+        # Interpolate between the filtered layers based on the local sigma_map value
+        indices = np.clip(np.searchsorted(bins, sigma_map) - 1, 0, num_bins - 2)
+        weight = (sigma_map - bins[indices]) / (bins[indices + 1] - bins[indices])
+        
+        # Gather the bounding layers per pixel
+        I, J = np.indices(channel_data.shape)
+        layer_low = np.array(filtered_layers)[indices, I, J]
+        layer_high = np.array(filtered_layers)[indices + 1, I, J]
+        
+        denoised[..., channel_index] = layer_low * (1 - weight) + layer_high * weight
+
+    return np.asarray(denoised, dtype=np.float64)
+
+
 def denoise_linear_rgb(
     normalized_image: np.ndarray,
     noise_profile: dict[str, object],
@@ -939,6 +1083,14 @@ def denoise_linear_rgb(
     diameter: int,
     sigma_space: float,
 ) -> np.ndarray:
+    if method == "adaptive_bilateral":
+        return denoise_linear_rgb_adaptive_bilateral(
+            normalized_image,
+            noise_profile,
+            strength=strength,
+            diameter=diameter,
+            sigma_space=sigma_space,
+        )
     if method == "bilateral":
         return denoise_linear_rgb_bilateral(
             normalized_image,
@@ -1444,6 +1596,13 @@ def summarize_model(
     reliable_patch_indices: np.ndarray | None = None,
     use_hppcc_gradient: bool = False,
     hppcc_gradient_harmonics: int = HPPCC_GRADIENT_HARMONICS,
+    use_hlcc: bool = True,
+    use_tps: bool = True,
+    use_lwcc: bool = True,
+    use_de00_opt: bool = True,
+    use_rpcc_ridge: bool = True,
+    use_wiener: bool = True,
+    use_pca: bool = True,
 ) -> dict[str, object]:
     # Baseline and RPCC-family models train on all patches for numerical stability.
     all_indices = np.arange(measured_rgb.shape[0], dtype=int)
@@ -1467,33 +1626,60 @@ def summarize_model(
     baseline_xyz = baseline.predict(measured_rgb)
     baseline_de00 = delta_e00_summary(src_module, baseline_xyz, reference_xyz, illuminant_white)
 
-    # ── RPCC: Root-Polynomial ────────────────────────────────────────────
-    rpcc = src_module.fit_rpcc(
-        measured_rgb_train, reference_xyz_train, white_index=white_index_train,
-    )
-    rpcc_xyz = rpcc.predict(measured_rgb)
-    rpcc_de00 = delta_e00_summary(src_module, rpcc_xyz, reference_xyz, illuminant_white)
-
-    # ── Ridge-RPCC: Tikhonov-regularised RPCC ───────────────────────────
-    rpcc_ridge = fit_rpcc_ridge(
-        measured_rgb_train, reference_xyz_train, white_index=white_index_train,
-    )
-    rpcc_ridge_xyz = rpcc_ridge.predict(measured_rgb)
-    rpcc_ridge_de00 = delta_e00_summary(src_module, rpcc_ridge_xyz, reference_xyz, illuminant_white)
-
     result = {
         "baseline": baseline,
         "baseline_de00": baseline_de00,
-        "rpcc": rpcc,
-        "rpcc_de00": rpcc_de00,
-        "rpcc_ridge": rpcc_ridge,
-        "rpcc_ridge_de00": rpcc_ridge_de00,
     }
-
     if reference_chroma is not None:
         result["baseline_chroma_error"] = chroma_error_summary(src_module, baseline_xyz, illuminant_white, reference_chroma)
-        result["rpcc_chroma_error"] = chroma_error_summary(src_module, rpcc_xyz, illuminant_white, reference_chroma)
-        result["rpcc_ridge_chroma_error"] = chroma_error_summary(src_module, rpcc_ridge_xyz, illuminant_white, reference_chroma)
+
+    # ── RPCC: Root-Polynomial ────────────────────────────────────────────
+    if use_rpcc:
+        rpcc = src_module.fit_rpcc(
+            measured_rgb_train, reference_xyz_train, white_index=white_index_train,
+        )
+        rpcc_xyz = rpcc.predict(measured_rgb)
+        rpcc_de00 = delta_e00_summary(src_module, rpcc_xyz, reference_xyz, illuminant_white)
+        result["rpcc"] = rpcc
+        result["rpcc_de00"] = rpcc_de00
+        if reference_chroma is not None:
+            result["rpcc_chroma_error"] = chroma_error_summary(src_module, rpcc_xyz, illuminant_white, reference_chroma)
+
+    # ── Ridge-RPCC: Tikhonov-regularised RPCC ───────────────────────────
+    if use_rpcc_ridge:
+        rpcc_ridge = fit_rpcc_ridge(
+            measured_rgb_train, reference_xyz_train, white_index=white_index_train,
+        )
+        rpcc_ridge_xyz = rpcc_ridge.predict(measured_rgb)
+        rpcc_ridge_de00 = delta_e00_summary(src_module, rpcc_ridge_xyz, reference_xyz, illuminant_white)
+        result["rpcc_ridge"] = rpcc_ridge
+        result["rpcc_ridge_de00"] = rpcc_ridge_de00
+        if reference_chroma is not None:
+            result["rpcc_ridge_chroma_error"] = chroma_error_summary(src_module, rpcc_ridge_xyz, illuminant_white, reference_chroma)
+
+    # ── Wiener: 3x3 regularised linear ──────────────────────────────────
+    if use_wiener:
+        wiener = src_module.fit_wiener(
+            measured_rgb_train, reference_xyz_train, white_index=white_index_train,
+        )
+        wiener_xyz = wiener.predict(measured_rgb)
+        wiener_de00 = delta_e00_summary(src_module, wiener_xyz, reference_xyz, illuminant_white)
+        result["wiener"] = wiener
+        result["wiener_de00"] = wiener_de00
+        if reference_chroma is not None:
+            result["wiener_chroma_error"] = chroma_error_summary(src_module, wiener_xyz, illuminant_white, reference_chroma)
+
+    # ── PCA: PCA-informed spectral linear ───────────────────────────────
+    if use_pca:
+        pca = src_module.fit_pca(
+            measured_rgb_train, reference_xyz_train, white_index=white_index_train,
+        )
+        pca_xyz = pca.predict(measured_rgb)
+        pca_de00 = delta_e00_summary(src_module, pca_xyz, reference_xyz, illuminant_white)
+        result["pca"] = pca
+        result["pca_de00"] = pca_de00
+        if reference_chroma is not None:
+            result["pca_chroma_error"] = chroma_error_summary(src_module, pca_xyz, illuminant_white, reference_chroma)
 
     too_few_chromatic = len(chromatic_indices_train) < 2
 
@@ -1551,7 +1737,7 @@ def summarize_model(
                 )
 
         # ── HLCC: Hue-Linear Color Correction ──────────────────────────
-        if not use_hppcc_gradient:
+        if use_hlcc and not use_hppcc_gradient:
             try:
                 hlcc = fit_hlcc(
                     measured_rgb_train, reference_xyz_train,
@@ -1573,52 +1759,55 @@ def summarize_model(
         result["hppcc"] = rpcc
         result["hppcc_de00"] = rpcc_de00
         if reference_chroma is not None:
-            result["hppcc_chroma_error"] = result["rpcc_chroma_error"]
+            result["hppcc_chroma_error"] = result.get("rpcc_chroma_error")
         if use_rpcc:
             result["hppcc_rpcc"] = rpcc
             result["hppcc_rpcc_de00"] = rpcc_de00
             if reference_chroma is not None:
-                result["hppcc_rpcc_chroma_error"] = result["rpcc_chroma_error"]
+                result["hppcc_rpcc_chroma_error"] = result.get("rpcc_chroma_error")
 
     # ── TPS: Thin-Plate Spline ──────────────────────────────────────────
-    try:
-        tps = fit_tps(measured_rgb_train, reference_xyz_train, white_index=white_index_train)
-        tps_xyz = tps.predict(measured_rgb)
-        tps_de00 = delta_e00_summary(src_module, tps_xyz, reference_xyz, illuminant_white)
-        result["tps"] = tps
-        result["tps_de00"] = tps_de00
-        if reference_chroma is not None:
-            result["tps_chroma_error"] = chroma_error_summary(src_module, tps_xyz, illuminant_white, reference_chroma)
-    except Exception:
-        pass
+    if use_tps:
+        try:
+            tps = fit_tps(measured_rgb_train, reference_xyz_train, white_index=white_index_train)
+            tps_xyz = tps.predict(measured_rgb)
+            tps_de00 = delta_e00_summary(src_module, tps_xyz, reference_xyz, illuminant_white)
+            result["tps"] = tps
+            result["tps_de00"] = tps_de00
+            if reference_chroma is not None:
+                result["tps_chroma_error"] = chroma_error_summary(src_module, tps_xyz, illuminant_white, reference_chroma)
+        except Exception:
+            pass
 
     # ── LWCC: Locally Weighted ──────────────────────────────────────────
-    try:
-        lwcc = fit_lwcc(measured_rgb_train, reference_xyz_train, white_index=white_index_train)
-        lwcc_xyz = lwcc.predict(measured_rgb)
-        lwcc_de00 = delta_e00_summary(src_module, lwcc_xyz, reference_xyz, illuminant_white)
-        result["lwcc"] = lwcc
-        result["lwcc_de00"] = lwcc_de00
-        if reference_chroma is not None:
-            result["lwcc_chroma_error"] = chroma_error_summary(src_module, lwcc_xyz, illuminant_white, reference_chroma)
-    except Exception:
-        pass
+    if use_lwcc:
+        try:
+            lwcc = fit_lwcc(measured_rgb_train, reference_xyz_train, white_index=white_index_train)
+            lwcc_xyz = lwcc.predict(measured_rgb)
+            lwcc_de00 = delta_e00_summary(src_module, lwcc_xyz, reference_xyz, illuminant_white)
+            result["lwcc"] = lwcc
+            result["lwcc_de00"] = lwcc_de00
+            if reference_chroma is not None:
+                result["lwcc_chroma_error"] = chroma_error_summary(src_module, lwcc_xyz, illuminant_white, reference_chroma)
+        except Exception:
+            pass
 
     # ── CIEDE2000-optimised linear ──────────────────────────────────────
-    try:
-        de00_opt = fit_de00_opt(
-            measured_rgb_train, reference_xyz_train,
-            white_index=white_index_train,
-            illuminant_white=illuminant_white,
-        )
-        de00_opt_xyz = de00_opt.predict(measured_rgb)
-        de00_opt_de00 = delta_e00_summary(src_module, de00_opt_xyz, reference_xyz, illuminant_white)
-        result["de00_opt"] = de00_opt
-        result["de00_opt_de00"] = de00_opt_de00
-        if reference_chroma is not None:
-            result["de00_opt_chroma_error"] = chroma_error_summary(src_module, de00_opt_xyz, illuminant_white, reference_chroma)
-    except Exception:
-        pass
+    if use_de00_opt:
+        try:
+            de00_opt = fit_de00_opt(
+                measured_rgb_train, reference_xyz_train,
+                white_index=white_index_train,
+                illuminant_white=illuminant_white,
+            )
+            de00_opt_xyz = de00_opt.predict(measured_rgb)
+            de00_opt_de00 = delta_e00_summary(src_module, de00_opt_xyz, reference_xyz, illuminant_white)
+            result["de00_opt"] = de00_opt
+            result["de00_opt_de00"] = de00_opt_de00
+            if reference_chroma is not None:
+                result["de00_opt_chroma_error"] = chroma_error_summary(src_module, de00_opt_xyz, illuminant_white, reference_chroma)
+        except Exception:
+            pass
 
     return result
 

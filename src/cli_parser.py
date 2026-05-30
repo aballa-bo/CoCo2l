@@ -11,7 +11,9 @@ from src.config import (
     DENOISE_DIAMETER,
     DENOISE_SIGMA_SPACE,
     DENOISE_STRENGTH,
+    DEVIGNETTING_METHOD,
     ENABLE_ADAPTIVE_SHARPEN,
+    ENABLE_DEVIGNETTING,
     ENABLE_PATCH_VARIANCE_DENOISE,
     ENABLE_PROCESS_WHITE_FIELD,
     HPPCC_BLEND_WIDTH,
@@ -38,6 +40,8 @@ from src.config import (
     USE_METADATA_RGB_XYZ_BASELINE,
     USE_RPCC,
     WHITE_INDEX,
+    ENABLE_UNDISTORT,
+    UNDISTORT_METHOD,
 )
 
 
@@ -71,6 +75,32 @@ def parse_standard_whites(value: str) -> dict[str, np.ndarray]:
 
 
 def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defaults: bool) -> None:
+    parser.add_argument(
+        "--undistort",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_UNDISTORT if use_defaults else None,
+        help="Enable lens geometric undistortion.",
+    )
+    parser.add_argument(
+        "--undistort-method",
+        type=str,
+        default=UNDISTORT_METHOD if use_defaults else None,
+        choices=("lensfun", "devernay", "aleman"),
+        help="Method for lens geometric undistortion.",
+    )
+    parser.add_argument(
+        "--devignetting",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_DEVIGNETTING if use_defaults else None,
+        help="Enable blind (single-image) devignetting correction.",
+    )
+    parser.add_argument(
+        "--devignetting-method",
+        type=str,
+        default=DEVIGNETTING_METHOD if use_defaults else None,
+        choices=("zheng", "goldman", "kim"),
+        help="Method for blind devignetting correction.",
+    )
     parser.add_argument(
         "--white-index",
         type=int,
@@ -121,7 +151,7 @@ def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defau
     )
     parser.add_argument(
         "--denoise-method",
-        choices=("wavelet", "bilateral"),
+        choices=("wavelet", "bilateral", "adaptive_bilateral"),
         default=DENOISE_METHOD if use_defaults else None,
         help="Denoising method used with the patch-derived noise profile.",
     )
@@ -218,6 +248,20 @@ def _add_analysis_config_arguments(parser: argparse.ArgumentParser, *, use_defau
         help="Enable Root-Polynomial residual stage on top of HPPCC (HPPCC+RPCC). "
              "Has no effect when --no-use-hppcc is set.",
     )
+    parser.add_argument(
+        "--output-label",
+        type=str,
+        default="hppcc_rpcc" if use_defaults else None,
+        choices=("baseline", "rpcc", "rpcc_ridge", "hppcc", "hppcc_rpcc", "hlcc", "tps", "lwcc", "de00_opt", "wiener", "pca"),
+        help="Model to apply to the output image.",
+    )
+    parser.add_argument("--use-hlcc", action=argparse.BooleanOptionalAction, default=True if use_defaults else None)
+    parser.add_argument("--use-tps", action=argparse.BooleanOptionalAction, default=True if use_defaults else None)
+    parser.add_argument("--use-lwcc", action=argparse.BooleanOptionalAction, default=True if use_defaults else None)
+    parser.add_argument("--use-de00-opt", action=argparse.BooleanOptionalAction, default=True if use_defaults else None)
+    parser.add_argument("--use-rpcc-ridge", action=argparse.BooleanOptionalAction, default=True if use_defaults else None)
+    parser.add_argument("--use-wiener", action=argparse.BooleanOptionalAction, default=True if use_defaults else None)
+    parser.add_argument("--use-pca", action=argparse.BooleanOptionalAction, default=True if use_defaults else None)
     parser.add_argument(
         "--hppcc-gradient",
         action=argparse.BooleanOptionalAction,

@@ -92,7 +92,15 @@ ENABLE_ADAPTIVE_SHARPEN = False
 SHARPEN_AMOUNT = 0.6
 SHARPEN_RADIUS = 1.0
 SHARPEN_THRESHOLD = 1.5
+ENABLE_UNDISTORT = True
+# Undistort method: "lensfun", "devernay", or "aleman".
+UNDISTORT_METHOD = "lensfun"
+
 ENABLE_PROCESS_WHITE_FIELD = False
+# Enable blind (single-image) devignetting correction.
+ENABLE_DEVIGNETTING = False
+# Blind devignetting method: "zheng", "goldman", or "kim".
+DEVIGNETTING_METHOD = "zheng"
 # Primary method controls.  USE_HPPCC enables the hue-plane model; USE_RPCC
 # adds a global Root-Polynomial residual stage on top of HPPCC.  Setting
 # USE_HPPCC=False is equivalent to the old --simple-linear flag.
@@ -105,6 +113,11 @@ RPCC_RIDGE_LAMBDA = 1e-3
 # Number of equal-width hue sectors for the Hue-Linear Color Correction model.
 # Must be ≥ 2; 4 matches the default HPPCC region count.
 HLCC_SECTORS = 4
+# Signal-to-Noise Ratio (SNR) for the Wiener estimation model.
+# Controls the regularization strength (lambda = 1/SNR).
+WIENER_SNR = 100.0
+# Number of spectral PCA components to use for PCA-based correction.
+PCA_COMPONENTS = 3
 SHOW_DETECTION_PREVIEW = False
 SHOW_DEVELOPED_IMAGE_PREVIEW = False
 OUTPUT_FORMAT = "jpeg"
