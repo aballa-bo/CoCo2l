@@ -8,7 +8,14 @@ import cv2
 import numpy as np
 from PIL import ImageCms
 
-from .config import HPPCC_GRADIENT_HARMONICS, HPPCC_REGION_SMOOTHNESS, PROJECT_ROOT
+from .config import (
+    HPPCC_GRADIENT_HARMONICS,
+    HPPCC_REGION_SMOOTHNESS,
+    PCA_COMPONENTS,
+    PROJECT_ROOT,
+    RPCC_RIDGE_LAMBDA,
+    WIENER_SNR,
+)
 from .models import (
     HLCCModel,
     HPPCCGradientModel,
@@ -1419,6 +1426,228 @@ def hppcc_model_from_dict(payload: dict[str, object]) -> HPPCCModel | HPPCCGradi
         white_rgb=np.asarray(payload["white_rgb"], dtype=np.float64),
         white_xyz=np.asarray(payload["white_xyz"], dtype=np.float64),
     )
+
+
+# ── Pipeline correction-stage dispatchers ────────────────────────────────────
+#
+# Ordered correction op ids — the single source of truth shared with the GUI
+# palette (``coco2.CORRECTION_OPS``) and the analyze cascade. Order matches the
+# legacy "Apply to final image" dropdown.
+CORRECTION_LABELS = (
+    "hppcc_rpcc", "hppcc", "baseline", "rpcc", "rpcc_ridge",
+    "hlcc", "tps", "lwcc", "de00_opt", "wiener", "pca",
+)
+
+
+def correction_model_to_dict(label: str, model) -> dict[str, object]:
+    """Serialise a fitted correction model, dispatching on its op id."""
+    if label in ("baseline", "wiener", "pca", "de00_opt"):
+        return linear_model_to_dict(model)
+    if label in ("rpcc", "rpcc_ridge"):
+        return rpcc_model_to_dict(model)
+    if label == "hppcc":
+        return hppcc_model_to_dict(model)
+    if label == "hppcc_rpcc":
+        return hppcc_rpcc_model_to_dict(model)
+    if label == "hlcc":
+        return hlcc_model_to_dict(model)
+    if label == "tps":
+        return tps_model_to_dict(model)
+    if label == "lwcc":
+        return lwcc_model_to_dict(model)
+    raise ValueError(f"Unknown correction label: {label!r}")
+
+
+def correction_model_from_dict(label: str, payload: dict[str, object]):
+    """Rebuild a fitted correction model from its serialised payload."""
+    if label in ("baseline", "wiener", "pca", "de00_opt"):
+        return linear_model_from_dict(payload)
+    if label in ("rpcc", "rpcc_ridge"):
+        return rpcc_model_from_dict(payload)
+    if label == "hppcc":
+        return hppcc_model_from_dict(payload)
+    if label == "hppcc_rpcc":
+        return hppcc_rpcc_model_from_dict(payload)
+    if label == "hlcc":
+        return hlcc_model_from_dict(payload)
+    if label == "tps":
+        return tps_model_from_dict(payload)
+    if label == "lwcc":
+        return lwcc_model_from_dict(payload)
+    raise ValueError(f"Unknown correction label: {label!r}")
+
+
+def predict_correction_stage(
+    label: str,
+    model,
+    rgb: np.ndarray,
+    *,
+    use_blending: bool,
+    blend_width: float,
+    hue_rgb: np.ndarray | None = None,
+) -> np.ndarray:
+    """Apply a single fitted correction model, mapping ``rgb -> XYZ``.
+
+    Shared apply-path for the analyze cascade, the legacy single-model output
+    and the processing replay, so all three render a given model identically.
+    """
+    if label == "hppcc_rpcc":
+        return predict_hppcc_rpcc(model, rgb, use_blending=use_blending, blend_width=blend_width, hue_rgb=hue_rgb)
+    if label == "hppcc":
+        return predict_hppcc(model, rgb, use_blending=use_blending, blend_width=blend_width, hue_rgb=hue_rgb)
+    return model.predict(rgb)
+
+
+def fit_correction_stage(
+    src_module,
+    label: str,
+    patches: np.ndarray,
+    target_xyz: np.ndarray,
+    illuminant_white: np.ndarray,
+    *,
+    white_index: int,
+    chromatic_indices: np.ndarray,
+    hppcc_regions: int,
+    reliable_patch_indices: np.ndarray | None = None,
+    optimize_boundaries: bool = True,
+    use_hppcc_blending: bool = False,
+    hppcc_blend_width: float = 0.15,
+    region_smoothness: float = HPPCC_REGION_SMOOTHNESS,
+    use_hppcc_gradient: bool = False,
+    hppcc_gradient_harmonics: int = HPPCC_GRADIENT_HARMONICS,
+    stage_params: dict | None = None,
+) -> tuple[object, str, dict[str, object]]:
+    """Fit a single correction model mapping ``patches -> target_xyz``.
+
+    Mirrors the per-label fitting in :func:`summarize_model` (same training
+    subset rules, same underlying fit calls) so that a one-stage pipeline
+    reproduces the legacy single-model output exactly. The analyze cascade calls
+    this once per correction stage on the *current* working patches.
+
+    ``stage_params`` carries the per-pipeline-instance settings (e.g. TPS
+    smoothing, ridge lambda, HPPCC region count). Any key it omits falls back to
+    the function defaults / ``hppcc_regions``, so a stage with no overrides
+    reproduces the previous behaviour.
+
+    Returns ``(model, effective_label, payload)``. ``effective_label`` usually
+    equals ``label`` but falls back to ``"rpcc"`` for hue-partition models when
+    there are too few chromatic patches (matching ``summarize_model``); callers
+    use it for both serialisation and prediction.
+    """
+    sp = stage_params or {}
+
+    def _bandwidth() -> float | None:
+        bw = sp.get("bandwidth")
+        if bw in (None, "", "auto"):
+            return None
+        return float(bw)
+
+    # HPPCC-family per-stage overrides (fall back to the legacy values).
+    # Note: blending (use_blending / blend_width) is a predict-time setting, so
+    # it is honoured by the caller's predict_correction_stage call, not here.
+    k_regions = int(sp.get("k_regions", hppcc_regions))
+    opt_bounds = bool(sp.get("optimize_boundaries", optimize_boundaries))
+    reg_smooth = float(sp.get("region_smoothness", region_smoothness))
+    use_grad = bool(sp.get("gradient", use_hppcc_gradient))
+    grad_harm = int(sp.get("gradient_harmonics", hppcc_gradient_harmonics))
+
+    measured_rgb_train = np.asarray(patches, dtype=np.float64)
+    reference_xyz_train = np.asarray(target_xyz, dtype=np.float64)
+
+    # HPPCC / HLCC chromatic partition uses only reliable patches.
+    if reliable_patch_indices is not None:
+        reliable_set = set(int(i) for i in reliable_patch_indices)
+        chromatic_indices_train = np.array(
+            [ci for ci in chromatic_indices if int(ci) in reliable_set], dtype=int
+        )
+    else:
+        chromatic_indices_train = np.asarray(chromatic_indices, dtype=int)
+    too_few_chromatic = len(chromatic_indices_train) < 2
+
+    effective = label
+    if label in ("hppcc", "hppcc_rpcc", "hlcc") and too_few_chromatic:
+        # Not enough chromatic patches to build a hue partition; fall back to
+        # RPCC, mirroring summarize_model's degenerate-case handling.
+        model = src_module.fit_rpcc(measured_rgb_train, reference_xyz_train, white_index=white_index)
+        effective = "rpcc"
+    elif label == "baseline":
+        model = src_module.fit_white_preserving_3x3(measured_rgb_train, reference_xyz_train, white_index=white_index)
+    elif label == "rpcc":
+        model = src_module.fit_rpcc(measured_rgb_train, reference_xyz_train, white_index=white_index)
+    elif label == "rpcc_ridge":
+        model = fit_rpcc_ridge(
+            measured_rgb_train, reference_xyz_train, white_index=white_index,
+            lambda_ridge=float(sp.get("lambda_ridge", RPCC_RIDGE_LAMBDA)),
+        )
+    elif label == "wiener":
+        model = src_module.fit_wiener(
+            measured_rgb_train, reference_xyz_train, white_index=white_index,
+            snr=float(sp.get("snr", WIENER_SNR)),
+        )
+    elif label == "pca":
+        model = src_module.fit_pca(
+            measured_rgb_train, reference_xyz_train, white_index=white_index,
+            n_components=int(sp.get("n_components", PCA_COMPONENTS)),
+        )
+    elif label == "de00_opt":
+        model = fit_de00_opt(
+            measured_rgb_train, reference_xyz_train,
+            white_index=white_index, illuminant_white=illuminant_white,
+        )
+    elif label == "tps":
+        model = fit_tps(
+            measured_rgb_train, reference_xyz_train, white_index=white_index,
+            smoothing=float(sp.get("smoothing", 0.0)),
+        )
+    elif label == "lwcc":
+        model = fit_lwcc(
+            measured_rgb_train, reference_xyz_train, white_index=white_index,
+            bandwidth=_bandwidth(),
+        )
+    elif label == "hlcc":
+        # k_sectors is decoupled from HPPCC's k_regions; when unset it follows
+        # the analysis-selected region count (legacy behaviour).
+        model = fit_hlcc(
+            measured_rgb_train, reference_xyz_train,
+            white_index=white_index, chromatic_indices=chromatic_indices_train,
+            k_sectors=int(sp.get("k_sectors", hppcc_regions)),
+        )
+    elif label == "hppcc":
+        if use_grad:
+            model = src_module.fit_hppcc_gradient(
+                measured_rgb_train, reference_xyz_train,
+                white_index=white_index, chromatic_indices=chromatic_indices_train,
+                n_harmonics=grad_harm,
+            )
+        else:
+            model = src_module.fit_hppcc(
+                measured_rgb_train, reference_xyz_train,
+                white_index=white_index, chromatic_indices=chromatic_indices_train,
+                k_regions=k_regions, optimize_boundaries=opt_bounds,
+                region_smoothness=reg_smooth,
+            )
+    elif label == "hppcc_rpcc":
+        if use_grad:
+            hppcc = src_module.fit_hppcc_gradient(
+                measured_rgb_train, reference_xyz_train,
+                white_index=white_index, chromatic_indices=chromatic_indices_train,
+                n_harmonics=grad_harm,
+            )
+            xyz_residual = reference_xyz_train - hppcc.predict(measured_rgb_train)
+            rpcc_res = src_module.fit_rpcc(measured_rgb_train, xyz_residual, white_index=white_index)
+            model = HPPCCRPCCModel(hppcc=hppcc, rpcc_residual=rpcc_res)
+        else:
+            model = src_module.fit_hppcc_rpcc(
+                measured_rgb_train, reference_xyz_train,
+                white_index=white_index, chromatic_indices=chromatic_indices_train,
+                k_regions=k_regions, optimize_boundaries=opt_bounds,
+                region_smoothness=reg_smooth,
+            )
+    else:
+        raise ValueError(f"Unknown correction label: {label!r}")
+
+    payload = correction_model_to_dict(effective, model)
+    return model, effective, payload
 
 
 def hlcc_model_to_dict(model: HLCCModel) -> dict[str, object]:

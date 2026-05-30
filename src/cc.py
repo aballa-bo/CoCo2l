@@ -1,5 +1,6 @@
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace as _dc_replace
+import json
 import sys
 import warnings
 from pathlib import Path
@@ -87,8 +88,12 @@ from src.report import (
 from src.utils import (
     _D50_WHITE,
     _D65_WHITE,
+    CORRECTION_LABELS,
     apply_matrix_transform,
     blend_model_with_linear_fallback,
+    correction_model_from_dict,
+    fit_correction_stage,
+    predict_correction_stage,
     apply_white_field_correction,
     apply_white_field_correction_to_patches,
     analyze_neutral_illuminant_gradient,
@@ -190,8 +195,163 @@ def _merge_process_settings(saved_settings: dict[str, object], args) -> dict[str
     return merged
 
 
+def _parse_pipeline_ids(pipeline_arg) -> list[str]:
+    """Split a ``--pipeline`` string into ordered op ids."""
+    if not pipeline_arg:
+        return []
+    return [op.strip() for op in str(pipeline_arg).split(",") if op.strip()]
+
+
+def _parse_pipeline_spec(args) -> list[dict]:
+    """Ordered pipeline entries ``[{"op", "params"}]``.
+
+    Prefers ``--pipeline-spec`` (a JSON array of ``{op, params}`` carrying the
+    per-instance settings); falls back to ``--pipeline`` ids with empty params.
+    """
+    spec = getattr(args, "pipeline_spec", None)
+    if spec:
+        try:
+            raw = json.loads(spec)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid --pipeline-spec JSON: {exc}") from exc
+        entries: list[dict] = []
+        for item in raw:
+            if isinstance(item, str):
+                entries.append({"op": item, "params": {}})
+            elif isinstance(item, dict) and item.get("op"):
+                entries.append({"op": str(item["op"]), "params": dict(item.get("params") or {})})
+        return entries
+    return [{"op": op, "params": {}} for op in _parse_pipeline_ids(getattr(args, "pipeline", None))]
+
+
+def _apply_preprocessing_params(args, entries: list[dict]) -> None:
+    """Copy each preprocessing entry's per-instance params onto ``args`` so the
+    existing preprocessing code uses them. Preprocessing runs once per type at
+    fixed points, so the first occurrence of each op wins.
+    """
+    seen: set[str] = set()
+    for entry in entries:
+        op = entry["op"]
+        if op in seen:
+            continue
+        p = entry.get("params") or {}
+        if op == "undistort":
+            if p.get("method"):
+                args.undistort_method = p["method"]
+            seen.add(op)
+        elif op == "devignetting":
+            if p.get("method"):
+                args.devignetting_method = p["method"]
+            seen.add(op)
+        elif op == "denoise":
+            if p.get("method"):
+                args.denoise_method = p["method"]
+            if "strength" in p:
+                args.denoise_strength = float(p["strength"])
+            if "diameter" in p:
+                args.denoise_diameter = int(p["diameter"])
+            if "sigma_space" in p:
+                args.denoise_sigma_space = float(p["sigma_space"])
+            seen.add(op)
+        elif op == "sharpen":
+            if "amount" in p:
+                args.sharpen_amount = float(p["amount"])
+            if "radius" in p:
+                args.sharpen_radius = float(p["radius"])
+            if "threshold" in p:
+                args.sharpen_threshold = float(p["threshold"])
+            seen.add(op)
+
+
+def _emit_step(index: int, op: str, status: str, *, mean_de00=None,
+               median_de00=None, reason: str | None = None, effective: str | None = None) -> None:
+    """Print a machine-parseable per-step status line for the GUI.
+
+    ``index`` is the position in the original pipeline spec (== the GUI row), so
+    the GUI can map the event straight onto a pipeline row. ``status`` is
+    "ok" or "skipped".
+    """
+    payload: dict[str, object] = {"index": int(index), "op": op, "status": status}
+    if mean_de00 is not None:
+        payload["mean_de00"] = float(mean_de00)
+    if median_de00 is not None:
+        payload["median_de00"] = float(median_de00)
+    if reason:
+        payload["reason"] = reason
+    if effective and effective != op:
+        payload["effective"] = effective
+    print("@@STEP@@ " + json.dumps(payload), flush=True)
+
+
+def _emit_applied_pipeline(applied: list[dict]) -> None:
+    """Print the final, actually-applied pipeline (ordered) for the GUI."""
+    print("@@PIPELINE@@ " + json.dumps({"applied": applied}), flush=True)
+
+
+def _pipeline_preprocessing_entries(args, pipeline_ids: list[str]) -> list[dict]:
+    """Record the preprocessing ops (with their methods/params) for the JSON.
+
+    The effective per-instance params have already been copied onto ``args`` by
+    :func:`_apply_preprocessing_params`, so reading them back from ``args`` here
+    captures exactly what was applied (and what processing replay must reuse).
+    """
+    entries: list[dict] = []
+    for op in pipeline_ids:
+        if op == "undistort":
+            entries.append({"op": "undistort", "method": getattr(args, "undistort_method", "lensfun")})
+        elif op == "devignetting":
+            entries.append({"op": "devignetting", "method": getattr(args, "devignetting_method", "zheng")})
+        elif op == "denoise":
+            entries.append({
+                "op": "denoise",
+                "method": args.denoise_method,
+                "strength": float(args.denoise_strength),
+                "diameter": int(args.denoise_diameter),
+                "sigma_space": float(args.denoise_sigma_space),
+            })
+        elif op == "sharpen":
+            entries.append({
+                "op": "sharpen",
+                "amount": float(args.sharpen_amount),
+                "radius": float(args.sharpen_radius),
+                "threshold": float(args.sharpen_threshold),
+            })
+    return entries
+
+
 def run_analysis(args) -> None:
     raw_path = args.cc_image if args.cc_image is not None else find_raw_path(args.image_dir)
+
+    # ── Explicit pipeline mode ──────────────────────────────────────────────
+    # When --pipeline is set, the ordered op list is the single source of truth:
+    # the preprocessing booleans are derived from membership (preprocessing
+    # necessarily precedes correction; its intra-group order is fixed by the
+    # maths, so only membership matters here) and the correction ops drive a
+    # residual cascade below. When --pipeline is absent the legacy single-model
+    # path (--output-label) is used unchanged.
+    pipeline_spec = _parse_pipeline_spec(args)
+    pipeline_ids = [entry["op"] for entry in pipeline_spec]
+    pipeline_mode = bool(pipeline_ids)
+    if pipeline_mode:
+        args.undistort = "undistort" in pipeline_ids
+        args.devignetting = "devignetting" in pipeline_ids
+        args.patch_variance_denoise = "denoise" in pipeline_ids
+        args.adaptive_sharpen = "sharpen" in pipeline_ids
+        _apply_preprocessing_params(args, pipeline_spec)
+        # Per-correction-stage params, in cascade order (op -> entries may repeat).
+        correction_stage_params = [
+            entry.get("params") or {}
+            for entry in pipeline_spec if entry["op"] in CORRECTION_LABELS
+        ]
+        # Spec-position maps so per-step status events line up with GUI rows.
+        correction_spec_indices = [
+            i for i, entry in enumerate(pipeline_spec) if entry["op"] in CORRECTION_LABELS
+        ]
+        preproc_spec_index: dict[str, int] = {}
+        for i, entry in enumerate(pipeline_spec):
+            op = entry["op"]
+            if op in ("undistort", "devignetting", "denoise", "sharpen") and op not in preproc_spec_index:
+                preproc_spec_index[op] = i
     reference_illuminant_white = args.standard_whites_json[args.reference_illuminant]
     native_reference_white = load_reference_white_xyz(args.reference_path, args.reference_space)
     if args.reference_space == "lab":
@@ -549,52 +709,188 @@ def run_analysis(args) -> None:
             threshold=float(args.sharpen_threshold),
         )
 
-    # ── Model Selection ──
-    output_label = args.output_label
-    if output_label not in best:
-        # Fallback to the most robust method if the requested one is missing
-        if use_hppcc and use_rpcc and "hppcc_rpcc" in best:
-            output_label = "hppcc_rpcc"
-        elif use_hppcc and "hppcc" in best:
-            output_label = "hppcc"
-        else:
+    # ── Model selection / correction cascade ──
+    pipeline_entries = None
+    if pipeline_mode:
+        correction_ids = [op for op in pipeline_ids if op in CORRECTION_LABELS]
+        preprocessing_entries = _pipeline_preprocessing_entries(args, pipeline_ids)
+        training_max_rgb = float(np.max(corrected_rgb))
+
+        # Emit per-step status for the preprocessing ops (which ran above) and
+        # seed the "actually applied" op list (with the effective params) for the
+        # final summary.
+        applied_steps: list[dict] = []
+        preproc_params_by_op = {
+            e["op"]: {k: v for k, v in e.items() if k != "op"} for e in preprocessing_entries
+        }
+        for op in sorted(preproc_spec_index, key=lambda o: preproc_spec_index[o]):
+            idx = preproc_spec_index[op]
+            if op == "undistort":
+                ok = undistort_info is not None
+                _emit_step(idx, op, "ok" if ok else "skipped",
+                           reason=None if ok else "camera/lens not found in Lensfun database")
+            elif op == "devignetting":
+                ok = bool(getattr(args, "devignetting", False))
+                _emit_step(idx, op, "ok" if ok else "skipped")
+            elif op == "denoise":
+                ok = bool(args.patch_variance_denoise) and noise_profile is not None
+                _emit_step(idx, op, "ok" if ok else "skipped",
+                           reason=None if ok else "noise profile unavailable")
+            elif op == "sharpen":
+                ok = bool(args.adaptive_sharpen)
+                _emit_step(idx, op, "ok" if ok else "skipped")
+            else:
+                ok = False
+            if ok:
+                applied_steps.append({"op": op, "params": preproc_params_by_op.get(op, {})})
+
+        guard_linear = chart_underexposed or chart_overexposed or gradient_near_neutral
+        if guard_linear or not correction_ids:
+            # Forced linear fallback (under/over-exposed chart or near-neutral
+            # gradient — today's behaviour) or no correction op chosen: render
+            # the white-preserving baseline for the whole image.
+            corrected_full_xyz = best["baseline"].predict(normalized_full_rgb)
             output_label = "baseline"
-
-    if output_label == "hppcc_rpcc":
-        corrected_full_xyz = predict_hppcc_rpcc(
-            best["hppcc_rpcc"],
-            normalized_full_rgb,
-            use_blending=args.use_hppcc_blending,
-            blend_width=args.hppcc_blend_width,
-        )
-    elif output_label == "hppcc":
-        corrected_full_xyz = predict_hppcc(
-            best["hppcc"],
-            normalized_full_rgb,
-            use_blending=args.use_hppcc_blending,
-            blend_width=args.hppcc_blend_width,
-        )
+            pipeline_entries = preprocessing_entries + [{
+                "op": "baseline", "model_label": "baseline",
+                "model": linear_model_to_dict(best["baseline"]),
+            }]
+            if chart_overexposed:
+                guard_reason = "chart over-exposed (white patch clipped)"
+            elif chart_underexposed:
+                guard_reason = "chart under-exposed"
+            elif gradient_near_neutral:
+                guard_reason = "near-neutral chromatic patch(es); gradient correction skipped"
+            else:
+                guard_reason = "no correction step selected"
+            for spec_i in correction_spec_indices:
+                _emit_step(spec_i, pipeline_spec[spec_i]["op"], "skipped", reason=guard_reason)
+            applied_steps.append({"op": "baseline", "params": {}, "reason": guard_reason})
+            _emit_applied_pipeline(applied_steps)
+        else:
+            # Residual cascade: keep one working full image and the chart patches
+            # in lock-step. Each stage is re-fit on the *current* patches mapping
+            # them to the (fixed) reference XYZ, then applied to both, so each
+            # stage refines the residual of the previous one.
+            #
+            # NOTE (scientific caveat): chaining models that each map a 3-vector
+            # to reference XYZ is a heuristic. After stage 1 the working image is
+            # in (scene-adapted) XYZ and later stages are re-fit on those XYZ
+            # patch values. HPPCC's hue partition and the white-preserving
+            # constraint still operate on 3-vectors so they stay well-defined,
+            # but this is a refinement cascade, not a rigorously derived model.
+            # A single-correction pipeline reproduces today's output exactly.
+            stage_kwargs = dict(
+                white_index=int(args.white_index),
+                chromatic_indices=np.asarray(args.chromatic_indices, dtype=int),
+                hppcc_regions=selected_k_regions,
+                reliable_patch_indices=reliable_patch_indices,
+                optimize_boundaries=True,
+                use_hppcc_blending=args.use_hppcc_blending,
+                hppcc_blend_width=args.hppcc_blend_width,
+                region_smoothness=args.hppcc_region_smoothness,
+                use_hppcc_gradient=use_hppcc_gradient,
+                hppcc_gradient_harmonics=gradient_harmonics,
+            )
+            working_full = normalized_full_rgb
+            working_patches = corrected_rgb
+            correction_entries: list[dict] = []
+            n_stages = len(correction_ids)
+            corrected_full_xyz = working_full
+            for stage_idx, label in enumerate(correction_ids):
+                stage_params = correction_stage_params[stage_idx]
+                # Blending is a predict-time setting; honour the per-instance
+                # value here (the fit ignores it).
+                stage_blend = bool(stage_params.get("use_blending", args.use_hppcc_blending))
+                stage_blend_width = float(stage_params.get("blend_width", args.hppcc_blend_width))
+                stage_input_full = working_full
+                stage_input_patches = working_patches
+                stage_training_max = float(np.max(stage_input_patches))
+                model, eff_label, payload = fit_correction_stage(
+                    src, label, stage_input_patches, adapted_reference_xyz, scene_white_xyz,
+                    stage_params=stage_params,
+                    **stage_kwargs,
+                )
+                working_full = predict_correction_stage(
+                    eff_label, model, working_full,
+                    use_blending=stage_blend, blend_width=stage_blend_width,
+                )
+                working_patches = predict_correction_stage(
+                    eff_label, model, working_patches,
+                    use_blending=stage_blend, blend_width=stage_blend_width,
+                )
+                entry = {"op": label, "model_label": eff_label, "model": payload, "params": stage_params}
+                correction_entries.append(entry)
+                stage_de00 = delta_e00_summary(src, working_patches, adapted_reference_xyz, scene_white_xyz)
+                stage_mean = float(np.mean(stage_de00))
+                stage_median = float(np.median(stage_de00))
+                print(
+                    f"  pipeline stage {stage_idx + 1}/{n_stages} [{label}]"
+                    f" -> mean dE00 {stage_mean:.3f}"
+                    f"  median {stage_median:.3f}"
+                    f"  max {float(np.max(stage_de00)):.3f}"
+                )
+                _emit_step(
+                    correction_spec_indices[stage_idx], label, "ok",
+                    mean_de00=stage_mean, median_de00=stage_median, effective=eff_label,
+                )
+                applied_steps.append({
+                    "op": label, "effective": eff_label, "params": stage_params,
+                    "mean_de00": stage_mean, "median_de00": stage_median,
+                })
+                if stage_idx == n_stages - 1:
+                    # Fade to the linear baseline of this final stage's input
+                    # above its fitted tonal range, so out-of-range highlights
+                    # stay sane instead of casting (applied once, on the last
+                    # stage only). Serialise the baseline + range so the
+                    # processing replay reproduces it without the chart.
+                    baseline_final = src.fit_white_preserving_3x3(
+                        stage_input_patches, adapted_reference_xyz, white_index=int(args.white_index),
+                    )
+                    linear_full_xyz = baseline_final.predict(stage_input_full)
+                    corrected_full_xyz = blend_model_with_linear_fallback(
+                        working_full, linear_full_xyz, stage_input_full, stage_training_max,
+                        full_fallback_factor=LINEAR_FALLBACK_RANGE_FACTOR,
+                    )
+                    entry["fallback_baseline"] = linear_model_to_dict(baseline_final)
+                    entry["training_max"] = stage_training_max
+            output_label = correction_ids[-1]
+            pipeline_entries = preprocessing_entries + correction_entries
+            _emit_applied_pipeline(applied_steps)
     else:
-        # HLCC, TPS, LWCC, and linear models
-        corrected_full_xyz = best[output_label].predict(normalized_full_rgb)
+        # ── Legacy single-model selection ──
+        output_label = args.output_label
+        if output_label not in best:
+            # Fallback to the most robust method if the requested one is missing
+            if use_hppcc and use_rpcc and "hppcc_rpcc" in best:
+                output_label = "hppcc_rpcc"
+            elif use_hppcc and "hppcc" in best:
+                output_label = "hppcc"
+            else:
+                output_label = "baseline"
 
-    # Under-exposed chart: HPPCC/RPCC is unreliable everywhere, use the linear
-    # baseline for the whole image. Otherwise keep HPPCC/RPCC but fade to the
-    # linear baseline above the fitted tonal range, so out-of-range highlights
-    # stay sane instead of casting.
-    training_max_rgb = float(np.max(corrected_rgb))
-    linear_full_xyz = best["baseline"].predict(normalized_full_rgb)
-    if chart_underexposed or chart_overexposed or gradient_near_neutral:
-        corrected_full_xyz = linear_full_xyz
-        output_label = "baseline"
-    else:
-        corrected_full_xyz = blend_model_with_linear_fallback(
-            corrected_full_xyz,
-            linear_full_xyz,
-            normalized_full_rgb,
-            training_max_rgb,
-            full_fallback_factor=LINEAR_FALLBACK_RANGE_FACTOR,
+        corrected_full_xyz = predict_correction_stage(
+            output_label, best[output_label], normalized_full_rgb,
+            use_blending=args.use_hppcc_blending, blend_width=args.hppcc_blend_width,
         )
+
+        # Under-exposed chart: HPPCC/RPCC is unreliable everywhere, use the linear
+        # baseline for the whole image. Otherwise keep HPPCC/RPCC but fade to the
+        # linear baseline above the fitted tonal range, so out-of-range highlights
+        # stay sane instead of casting.
+        training_max_rgb = float(np.max(corrected_rgb))
+        linear_full_xyz = best["baseline"].predict(normalized_full_rgb)
+        if chart_underexposed or chart_overexposed or gradient_near_neutral:
+            corrected_full_xyz = linear_full_xyz
+            output_label = "baseline"
+        else:
+            corrected_full_xyz = blend_model_with_linear_fallback(
+                corrected_full_xyz,
+                linear_full_xyz,
+                normalized_full_rgb,
+                training_max_rgb,
+                full_fallback_factor=LINEAR_FALLBACK_RANGE_FACTOR,
+            )
     corrected_full_output_rgb = render_xyz_to_display(corrected_full_xyz, scene_white_xyz, args.output_colorspace)
     corrected_full_output_rgb = neutralize_blown_highlights(corrected_full_output_rgb, blown_highlight_weight)
     corrected_full_uint8 = to_uint8_image(corrected_full_output_rgb)
@@ -673,6 +969,8 @@ def run_analysis(args) -> None:
                 "output_colorspace": args.output_colorspace,
                 "undistort": undistort_info if undistort_info is not None
                              else {"applied": False},
+                "devignetting": bool(getattr(args, "devignetting", False)),
+                "devignetting_method": getattr(args, "devignetting_method", DEVIGNETTING_METHOD),
                 "white_field": white_field_params,
             },
             "selection": {"selected_k_regions": selected_k_regions},
@@ -681,6 +979,10 @@ def run_analysis(args) -> None:
                 "noise_profile": noise_profile,
             },
             "models": models_payload,
+            # Ordered pipeline (preprocessing + correction stages). Present only
+            # in --pipeline mode; processing replays this cascade when set, and
+            # falls back to the legacy single-model path (output_label) when None.
+            "pipeline": pipeline_entries,
         },
     )
 
@@ -789,6 +1091,7 @@ def run_process(args) -> None:
     settings = _merge_process_settings(payload["settings"], args)
     diagnostics = payload.get("diagnostics", {})
     models_payload = payload["models"]
+    pipeline_entries = payload.get("pipeline")
     # Determine which model was selected during analysis.
     # New JSONs store output_label explicitly; old JSONs use perform_nonlinear_corrections flag.
     saved_output_label = settings.get("output_label")
@@ -823,14 +1126,14 @@ def run_process(args) -> None:
 
     if worker_count == 1:
         for raw_path in raw_paths:
-            output_paths = _process_single_raw(raw_path, output_dir, settings, diagnostics, models_payload, saved_output_label)
+            output_paths = _process_single_raw(raw_path, output_dir, settings, diagnostics, models_payload, saved_output_label, pipeline_entries)
             outputs_text = ", ".join(str(path) for path in output_paths)
             print(f"Processed: {raw_path} -> {outputs_text}")
         return
 
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         futures = {
-            executor.submit(_process_single_raw, raw_path, output_dir, settings, diagnostics, models_payload, saved_output_label): raw_path
+            executor.submit(_process_single_raw, raw_path, output_dir, settings, diagnostics, models_payload, saved_output_label, pipeline_entries): raw_path
             for raw_path in raw_paths
         }
         for future in as_completed(futures):
@@ -847,15 +1150,26 @@ def _process_single_raw(
     diagnostics: dict[str, object],
     models_payload: dict[str, object],
     output_label: str,
+    pipeline_entries: list[dict] | None = None,
 ) -> list[Path]:
     use_blending = bool(settings["use_hppcc_blending"])
     blend_width = float(settings["hppcc_blend_width"])
     output_colorspace = settings.get("output_colorspace", OUTPUT_COLORSPACE)
     scene_white_xyz = np.asarray(settings["scene_white_xyz"], dtype=np.float64)
     output_paths: list[Path] = []
+    # Per-instance preprocessing params recorded in the pipeline entries (when
+    # present) take precedence over the global ``settings`` block; the on/off
+    # gating still comes from ``settings`` (it mirrors pipeline membership).
+    preproc = {
+        e["op"]: e
+        for e in (pipeline_entries or [])
+        if e.get("op") in ("undistort", "devignetting", "denoise", "sharpen")
+    }
     raw = src.load_image_linear_rgb(raw_path)
     if settings.get("undistort", {}).get("applied", False):
-        undistorted_rgb, undistort_info = try_undistort(raw.rgb, raw_path)
+        undistort_method = str(preproc.get("undistort", {}).get(
+            "method", settings.get("undistort_method", "lensfun")))
+        undistorted_rgb, undistort_info = try_undistort(raw.rgb, raw_path, method=undistort_method)
         if undistort_info is not None:
             raw = _dc_replace(raw, rgb=undistorted_rgb)
         else:
@@ -875,27 +1189,30 @@ def _process_single_raw(
     if white_field_params:
         normalized_full_rgb = apply_white_field_correction(normalized_full_rgb, white_field_params)
     if bool(settings.get("devignetting", False)):
-        method = str(settings.get("devignetting_method", "zheng"))
+        method = str(preproc.get("devignetting", {}).get(
+            "method", settings.get("devignetting_method", "zheng")))
         normalized_full_rgb = apply_devignetting(normalized_full_rgb, method=method)
     blown_highlight_weight = highlight_blowout_weight(normalized_full_rgb)
     normalized_full_rgb = desaturate_highlights(normalized_full_rgb)
     noise_profile = diagnostics.get("noise_profile")
+    _dn = preproc.get("denoise", {})
     if bool(settings.get("patch_variance_denoise", False)) and noise_profile is not None:
         normalized_full_rgb = denoise_linear_rgb(
             normalized_full_rgb,
             noise_profile,
-            method=str(settings.get("denoise_method", DENOISE_METHOD)),
-            strength=float(settings.get("denoise_strength", DENOISE_STRENGTH)),
-            diameter=int(settings.get("denoise_diameter", DENOISE_DIAMETER)),
-            sigma_space=float(settings.get("denoise_sigma_space", DENOISE_SIGMA_SPACE)),
+            method=str(_dn.get("method", settings.get("denoise_method", DENOISE_METHOD))),
+            strength=float(_dn.get("strength", settings.get("denoise_strength", DENOISE_STRENGTH))),
+            diameter=int(_dn.get("diameter", settings.get("denoise_diameter", DENOISE_DIAMETER))),
+            sigma_space=float(_dn.get("sigma_space", settings.get("denoise_sigma_space", DENOISE_SIGMA_SPACE))),
         )
+    _sh = preproc.get("sharpen", {})
     if bool(settings.get("adaptive_sharpen", False)):
         normalized_full_rgb = sharpen_adaptive_rgb(
             normalized_full_rgb,
             noise_profile,
-            amount=float(settings.get("sharpen_amount", SHARPEN_AMOUNT)),
-            radius=float(settings.get("sharpen_radius", SHARPEN_RADIUS)),
-            threshold=float(settings.get("sharpen_threshold", SHARPEN_THRESHOLD)),
+            amount=float(_sh.get("amount", settings.get("sharpen_amount", SHARPEN_AMOUNT))),
+            radius=float(_sh.get("radius", settings.get("sharpen_radius", SHARPEN_RADIUS))),
+            threshold=float(_sh.get("threshold", settings.get("sharpen_threshold", SHARPEN_THRESHOLD))),
         )
     extension = output_extension(settings.get("output_format", OUTPUT_FORMAT))
     icc_profile_bytes = get_icc_profile_bytes(settings.get("output_colorspace", OUTPUT_COLORSPACE))
@@ -924,7 +1241,43 @@ def _process_single_raw(
             f"  Advanced correction is disabled as recorded in the analysis JSON.\n"
         )
 
-    if output_label == "baseline":
+    correction_replay = (
+        [e for e in pipeline_entries if "model" in e] if pipeline_entries else []
+    )
+    if correction_replay:
+        # Replay the residual cascade recorded during analysis. Each stage
+        # rebuilds its fitted model from the stored payload and chains the
+        # working full image through them in XYZ; the final-stage linear-fallback
+        # blend is reproduced from the serialised baseline + training range.
+        working_full = normalized_full_rgb
+        n_stages = len(correction_replay)
+        for stage_idx, entry in enumerate(correction_replay):
+            model_label = entry.get("model_label", entry["op"])
+            stage_model = correction_model_from_dict(model_label, entry["model"])
+            entry_params = entry.get("params") or {}
+            stage_blend = bool(entry_params.get("use_blending", use_blending))
+            stage_blend_width = float(entry_params.get("blend_width", blend_width))
+            stage_input_full = working_full
+            working_full = predict_correction_stage(
+                model_label, stage_model, working_full,
+                use_blending=stage_blend, blend_width=stage_blend_width,
+            )
+            if stage_idx == n_stages - 1 and entry.get("fallback_baseline") is not None:
+                baseline_final = linear_model_from_dict(entry["fallback_baseline"])
+                training_max_rgb = entry.get("training_max")
+                training_max_rgb = (
+                    float(np.max(baseline_final.white_rgb))
+                    if training_max_rgb is None else float(training_max_rgb)
+                )
+                working_full = blend_model_with_linear_fallback(
+                    working_full,
+                    baseline_final.predict(stage_input_full),
+                    stage_input_full,
+                    training_max_rgb,
+                    full_fallback_factor=LINEAR_FALLBACK_RANGE_FACTOR,
+                )
+        corrected_full_xyz = working_full
+    elif output_label == "baseline":
         corrected_full_xyz = baseline_model.predict(normalized_full_rgb)
     elif output_label == "rpcc":
         model = rpcc_model_from_dict(models_payload["rpcc"])
@@ -962,7 +1315,7 @@ def _process_single_raw(
             model, normalized_full_rgb, use_blending=use_blending, blend_width=blend_width,
         )
 
-    if output_label != "baseline":
+    if not correction_replay and output_label != "baseline":
         # Fade to the linear baseline above the fitted tonal range so
         # out-of-range highlights stay sane instead of casting.
         training_max_rgb = settings.get("training_max_rgb")

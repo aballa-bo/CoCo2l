@@ -326,6 +326,27 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--process-dir", type=Path, default=PROCESS_DIR, help="Output directory for the developed image. Pass the same path as --analysis-dir to collect all outputs in one folder.")
     analyze.add_argument("--roi", type=parse_roi, default=None, metavar="x1,y1,x2,y2",
                          help="Pixel crop applied to the RAW before color checker detection (e.g. 200,100,1800,1200).")
+    analyze.add_argument(
+        "--pipeline",
+        type=str,
+        default=None,
+        help="Comma-separated ordered op ids forming an explicit processing pipeline, "
+             "drawn from the preprocessing ids (undistort, devignetting, denoise, sharpen) "
+             "and the correction labels (baseline, rpcc, rpcc_ridge, hppcc, hppcc_rpcc, "
+             "hlcc, tps, lwcc, de00_opt, wiener, pca). Preprocessing ops always run first "
+             "(their intra-group order is fixed by the maths); correction ops run in the "
+             "given order as a residual cascade. When omitted, the legacy single-model "
+             "path driven by --output-label is used.",
+    )
+    analyze.add_argument(
+        "--pipeline-spec",
+        type=str,
+        default=None,
+        help="JSON array of ordered pipeline entries with per-instance parameters, "
+             'e.g. [{"op":"undistort","params":{"method":"lensfun"}},'
+             '{"op":"tps","params":{"smoothing":0.05}}]. Supersedes --pipeline when '
+             "present; the op order and params come from this spec.",
+    )
     _add_analysis_config_arguments(analyze, use_defaults=True)
 
     process = subparsers.add_parser("process", help="Process a folder of RAW files using a saved analysis result.")

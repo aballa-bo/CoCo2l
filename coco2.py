@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +17,7 @@ from PyQt6.QtWidgets import (
     QRubberBand, QMessageBox, QGroupBox, QSizePolicy, QSplitter,
     QDialog, QDialogButtonBox, QScrollArea, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QTextBrowser, QWidgetAction,
+    QTextBrowser, QWidgetAction, QListWidget, QListWidgetItem, QToolButton,
 )
 from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal, QRect, QSize, QPoint, QEvent
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont, QAction
@@ -566,51 +567,410 @@ class DevelopedPreview(_ZoomableImagePreview):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Operation pipeline (palette + ordered drop target)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Single source of truth for op ids, mirrored on the backend by
+# src.utils.CORRECTION_LABELS and the --pipeline op id set. Preprocessing ops
+# always run before correction ops (their intra-group order is fixed by the
+# maths); the pipeline governs *which* preprocessing ops run and the full
+# correction-stage order.
+PREPROCESSING_OPS = ("undistort", "devignetting", "denoise", "sharpen")
+# Correction ops split by linearity for the palette. Strictly-linear 3x3 models
+# first, then locally-linear ones; the genuinely non-linear models form their
+# own group. `CORRECTION_OPS` keeps the combined set for membership checks
+# (order is irrelevant there).
+CORRECTION_LINEAR_OPS = ("baseline", "wiener", "pca", "de00_opt", "hppcc", "hlcc", "lwcc")
+CORRECTION_NONLINEAR_OPS = ("rpcc", "rpcc_ridge", "hppcc_rpcc", "tps")
+CORRECTION_OPS = CORRECTION_LINEAR_OPS + CORRECTION_NONLINEAR_OPS
+ALL_OPS = PREPROCESSING_OPS + CORRECTION_OPS
+OP_LABELS = {
+    "undistort": "Undistort",
+    "devignetting": "Devignetting",
+    "denoise": "Denoise",
+    "sharpen": "Sharpen",
+    "hppcc_rpcc": "hppcc_rpcc",
+    "hppcc": "hppcc",
+    "baseline": "baseline",
+    "rpcc": "rpcc",
+    "rpcc_ridge": "rpcc_ridge",
+    "hlcc": "hlcc",
+    "tps": "tps",
+    "lwcc": "lwcc",
+    "de00_opt": "de00_opt",
+    "wiener": "wiener",
+    "pca": "pca",
+}
+LABEL_TO_OP = {label: op for op, label in OP_LABELS.items()}
+
+# Per-op default parameters. The keys mirror the backend's stage params
+# (src.utils.fit_correction_stage / cc.py preprocessing). Ops absent here
+# (baseline, rpcc, de00_opt) have no tunable parameters, so they get no gear.
+OP_DEFAULTS: dict[str, dict] = {
+    "undistort": {"method": "lensfun"},
+    "devignetting": {"method": "zheng"},
+    "denoise": {"method": "wavelet", "strength": 6.0, "diameter": 5, "sigma_space": 2.0},
+    "sharpen": {"amount": 0.6, "radius": 1.0, "threshold": 1.5},
+    "hppcc": {
+        "k_regions": 4, "optimize_boundaries": True, "region_smoothness": 0.0,
+        "use_blending": True, "blend_width": 0.15, "gradient": False, "gradient_harmonics": 2,
+    },
+    "hppcc_rpcc": {
+        "k_regions": 4, "optimize_boundaries": True, "region_smoothness": 0.0,
+        "use_blending": True, "blend_width": 0.15, "gradient": False, "gradient_harmonics": 2,
+    },
+    "rpcc_ridge": {"lambda_ridge": 1e-3},
+    "hlcc": {"k_sectors": 4},
+    "tps": {"smoothing": 0.0},
+    "lwcc": {"bandwidth": None},   # None == auto
+    "wiener": {"snr": 100.0},
+    "pca": {"n_components": 3},
+}
+OP_HAS_PARAMS = set(OP_DEFAULTS)
+
+
+def _make_op_item(op: str) -> QListWidgetItem:
+    item = QListWidgetItem(OP_LABELS.get(op, op))
+    item.setData(Qt.ItemDataRole.UserRole, op)
+    return item
+
+
+class OperationPalette(QWidget):
+    """Two stacked drag-only lists: Preprocessing and Correction.
+
+    Each item stores its op id in ``Qt.ItemDataRole.UserRole``. The lists are
+    drag-only and copy on drag, so the source items stay put while a copy is
+    dropped into the :class:`PipelineList`.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        v.addWidget(QLabel("<b>Operations</b>"))
+        v.addWidget(QLabel("Preprocessing"))
+        self._pre = self._make_list(PREPROCESSING_OPS)
+        v.addWidget(self._pre)
+        v.addWidget(QLabel("Linear / locally linear corrections"))
+        self._corr_linear = self._make_list(CORRECTION_LINEAR_OPS)
+        v.addWidget(self._corr_linear, 1)
+        v.addWidget(QLabel("Non-linear corrections"))
+        self._corr_nonlinear = self._make_list(CORRECTION_NONLINEAR_OPS)
+        v.addWidget(self._corr_nonlinear, 1)
+
+    @staticmethod
+    def _make_list(ops: tuple[str, ...]) -> QListWidget:
+        lst = QListWidget()
+        lst.setDragEnabled(True)
+        lst.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        lst.setDefaultDropAction(Qt.DropAction.CopyAction)
+        lst.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        for op in ops:
+            lst.addItem(_make_op_item(op))
+        return lst
+
+
+class _PipelineRow(QWidget):
+    """Row widget for a pipeline entry: status icon + op label + ΔE info +
+    (optional) gear button."""
+
+    def __init__(self, op: str, on_gear) -> None:
+        super().__init__()
+        h = QHBoxLayout(self)
+        h.setContentsMargins(6, 2, 6, 2)
+        h.setSpacing(6)
+        self._status = QLabel("")
+        self._status.setFixedWidth(16)
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        h.addWidget(self._status)
+        h.addWidget(QLabel(OP_LABELS.get(op, op)))
+        self._info = QLabel("")
+        self._info.setStyleSheet("color:#9aa0a6;")
+        h.addWidget(self._info, 1)
+        if op in OP_HAS_PARAMS:
+            gear = QToolButton()
+            gear.setText("⚙")   # ⚙
+            gear.setAutoRaise(True)
+            gear.setCursor(Qt.CursorShape.PointingHandCursor)
+            gear.setToolTip("Edit settings for this step")
+            gear.clicked.connect(on_gear)
+            h.addWidget(gear)
+
+    def set_status(self, icon: str, color: str = "", tooltip: str = "") -> None:
+        self._status.setText(icon)
+        self._status.setStyleSheet(f"color:{color};" if color else "")
+        self._status.setToolTip(tooltip)
+
+    def set_info(self, text: str) -> None:
+        self._info.setText(text)
+
+
+class PipelineList(QListWidget):
+    """Ordered drop target with per-instance operation settings.
+
+    A Python list of ``{"op", "params"}`` entries is the single source of truth;
+    each row renders the op label plus a gear button (for ops with tunable
+    params) that opens its settings dialog. Accepts copies dropped from the
+    palette and supports internal drag reordering; Delete removes the selected
+    entry and double-click opens its settings. Duplicates are allowed.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setToolTip(
+            "Drag operations here and reorder them. Correction steps run "
+            "top-to-bottom as a residual cascade; preprocessing always runs "
+            "first regardless of position. Click the gear to edit a step's "
+            "settings; press Delete to remove it."
+        )
+        self._entries: list[dict] = []
+        self._raw_path_provider = None   # set by AnalyzeTab; feeds Undistort dialog
+        self.itemDoubleClicked.connect(lambda item: self._open_settings(self.row(item)))
+
+    # ── source of truth ─────────────────────────────────────────────────────
+    def ops(self) -> list[str]:
+        return [e["op"] for e in self._entries]
+
+    def entries(self) -> list[dict]:
+        return [{"op": e["op"], "params": deepcopy(e.get("params", {}))} for e in self._entries]
+
+    def set_entries(self, entries) -> None:
+        self._entries = []
+        for e in (entries or []):
+            if isinstance(e, str):          # legacy persisted format (op ids only)
+                op, params = e, {}
+            elif isinstance(e, dict) and e.get("op"):
+                op, params = e["op"], dict(e.get("params") or {})
+            else:
+                continue
+            if op in ALL_OPS:
+                merged = deepcopy(OP_DEFAULTS.get(op, {}))
+                merged.update(params)
+                self._entries.append({"op": op, "params": merged})
+        self._rebuild()
+
+    # ``set_ops`` kept for call sites that only deal in op ids.
+    def set_ops(self, ops) -> None:
+        self.set_entries(list(ops or []))
+
+    def clear(self) -> None:
+        self._entries = []
+        super().clear()
+
+    # ── per-step run status (driven by the analysis subprocess) ──────────────
+    def _row_widget(self, index: int):
+        item = self.item(index)
+        return self.itemWidget(item) if item is not None else None
+
+    def mark_all_pending(self) -> None:
+        """Put an hourglass on every step before a run starts."""
+        for i in range(self.count()):
+            w = self._row_widget(i)
+            if w is not None:
+                w.set_status("⏳", "#e0a000", "Pending")
+                w.set_info("")
+
+    def clear_status(self) -> None:
+        for i in range(self.count()):
+            w = self._row_widget(i)
+            if w is not None:
+                w.set_status("")
+                w.set_info("")
+
+    def set_step_status(self, index: int, status: str, *, mean=None, median=None,
+                        reason: str = "", effective: str = "") -> None:
+        w = self._row_widget(index)
+        if w is None:
+            return
+        if status == "ok":
+            tip = f"Applied as {effective}" if effective else "Applied"
+            w.set_status("✓", "#2ecc71", tip)
+            if mean is not None and median is not None:
+                # ΔE₀₀ with Greek delta and subscript zeros.
+                w.set_info(f"ΔE₀₀ mean {mean:.2f} / median {median:.2f}")
+        elif status == "skipped":
+            w.set_status("❗", "#e74c3c", reason or "Skipped")
+            w.set_info(reason or "skipped")
+
+    # ── rendering ────────────────────────────────────────────────────────────
+    def _rebuild(self, select: int = -1) -> None:
+        self.blockSignals(True)
+        QListWidget.clear(self)   # clear the view only; keep self._entries
+        for i, entry in enumerate(self._entries):
+            op = entry["op"]
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, op)
+            self.addItem(item)
+            row = _PipelineRow(op, lambda _checked=False, idx=i: self._open_settings(idx))
+            item.setSizeHint(row.sizeHint())
+            self.setItemWidget(item, row)
+        self.blockSignals(False)
+        if 0 <= select < self.count():
+            self.setCurrentRow(select)
+
+    def _open_settings(self, idx: int) -> None:
+        if not (0 <= idx < len(self._entries)):
+            return
+        entry = self._entries[idx]
+        dlg_cls = OP_DIALOGS.get(entry["op"])
+        if dlg_cls is None:
+            return
+        raw_path = self._raw_path_provider() if self._raw_path_provider else ""
+        dlg = dlg_cls(entry.get("params", {}), parent=self, raw_path=raw_path)
+        if dlg.exec():
+            entry["params"] = dlg.get_settings()
+
+    # ── drag & drop ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _drag_ok(src) -> bool:
+        return isinstance(src, QListWidget)
+
+    def dragEnterEvent(self, event) -> None:
+        if self._drag_ok(event.source()):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if self._drag_ok(event.source()):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def _drop_row(self, event) -> int:
+        idx = self.indexAt(event.position().toPoint())
+        if not idx.isValid():
+            return len(self._entries)
+        row = idx.row()
+        if self.dropIndicatorPosition() == QAbstractItemView.DropIndicatorPosition.BelowItem:
+            row += 1
+        return row
+
+    def dropEvent(self, event) -> None:
+        src = event.source()
+        target = self._drop_row(event)
+        if src is self:
+            source_row = self.currentRow()
+            if not (0 <= source_row < len(self._entries)):
+                event.ignore(); return
+            entry = self._entries.pop(source_row)
+            if source_row < target:
+                target -= 1
+            target = max(0, min(target, len(self._entries)))
+            self._entries.insert(target, entry)
+            event.accept()
+            self._rebuild(select=target)
+        elif isinstance(src, QListWidget):
+            item = src.currentItem()
+            if item is None:
+                event.ignore(); return
+            op = item.data(Qt.ItemDataRole.UserRole) or LABEL_TO_OP.get(item.text(), item.text())
+            if op not in ALL_OPS:
+                event.ignore(); return
+            target = max(0, min(target, len(self._entries)))
+            self._entries.insert(target, {"op": op, "params": deepcopy(OP_DEFAULTS.get(op, {}))})
+            event.accept()
+            self._rebuild(select=target)
+        else:
+            event.ignore()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            row = self.currentRow()
+            if 0 <= row < len(self._entries):
+                self._entries.pop(row)
+                self._rebuild(select=min(row, len(self._entries) - 1))
+            return
+        super().keyPressEvent(event)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Denoise settings dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
-class DenoiseSettingsDialog(QDialog):
-    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
+class OpSettingsDialog(QDialog):
+    """Base for per-instance op settings dialogs.
+
+    Subclasses set ``OP``/``TITLE`` and implement ``_build(form)`` (add field
+    rows), ``_load(params)`` (populate widgets) and ``get_settings()``. The base
+    wires OK / Cancel plus a **Revert to default** button that reloads
+    ``OP_DEFAULTS[OP]`` into the fields.
+    """
+
+    OP = ""
+    TITLE = "Settings"
+    MIN_WIDTH = 340
+
+    def __init__(self, params: dict | None = None, parent: QWidget | None = None,
+                 raw_path: str = "") -> None:
         super().__init__(parent)
-        self.setWindowTitle("Denoise settings")
-        self.setMinimumWidth(320)
+        self._raw_path = raw_path
+        self.setWindowTitle(self.TITLE)
+        self.setMinimumWidth(self.MIN_WIDTH)
 
         form = QFormLayout()
         form.setSpacing(8)
-
-        self._method = QComboBox()
-        self._method.addItems(["wavelet", "bilateral", "adaptive_bilateral"])
-        self._method.setCurrentText(cfg.get("method", "wavelet"))
-        form.addRow("Method:", self._method)
-
-        self._strength = QDoubleSpinBox()
-        self._strength.setRange(0.1, 50.0)
-        self._strength.setSingleStep(0.5)
-        self._strength.setDecimals(1)
-        self._strength.setValue(cfg.get("strength", 6.0))
-        form.addRow("Strength:", self._strength)
-
-        self._diameter = QSpinBox()
-        self._diameter.setRange(1, 30)
-        self._diameter.setValue(cfg.get("diameter", 5))
-        form.addRow("Diameter (bilateral):", self._diameter)
-
-        self._sigma_space = QDoubleSpinBox()
-        self._sigma_space.setRange(0.1, 20.0)
-        self._sigma_space.setSingleStep(0.1)
-        self._sigma_space.setDecimals(1)
-        self._sigma_space.setValue(cfg.get("sigma_space", 2.0))
-        form.addRow("Sigma space (bilateral):", self._sigma_space)
+        self._build(form)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.RestoreDefaults
+            | QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        revert = buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults)
+        revert.setText("Revert to default")
+        revert.clicked.connect(lambda: self._load(dict(OP_DEFAULTS.get(self.OP, {}))))
 
         root = QVBoxLayout(self)
         root.addLayout(form)
         root.addWidget(buttons)
+
+        merged = dict(OP_DEFAULTS.get(self.OP, {}))
+        if params:
+            merged.update(params)
+        self._load(merged)
+
+    # ── subclass hooks ──────────────────────────────────────────────────────
+    def _build(self, form: QFormLayout) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _load(self, params: dict) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def get_settings(self) -> dict:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+class DenoiseSettingsDialog(OpSettingsDialog):
+    OP = "denoise"
+    TITLE = "Denoise settings"
+
+    def _build(self, form: QFormLayout) -> None:
+        self._method = QComboBox()
+        self._method.addItems(["wavelet", "bilateral", "adaptive_bilateral"])
+        form.addRow("Method:", self._method)
+        self._strength = QDoubleSpinBox()
+        self._strength.setRange(0.1, 50.0); self._strength.setSingleStep(0.5); self._strength.setDecimals(1)
+        form.addRow("Strength:", self._strength)
+        self._diameter = QSpinBox(); self._diameter.setRange(1, 30)
+        form.addRow("Diameter (bilateral):", self._diameter)
+        self._sigma_space = QDoubleSpinBox()
+        self._sigma_space.setRange(0.1, 20.0); self._sigma_space.setSingleStep(0.1); self._sigma_space.setDecimals(1)
+        form.addRow("Sigma space (bilateral):", self._sigma_space)
+
+    def _load(self, p: dict) -> None:
+        self._method.setCurrentText(str(p.get("method", "wavelet")))
+        self._strength.setValue(float(p.get("strength", 6.0)))
+        self._diameter.setValue(int(p.get("diameter", 5)))
+        self._sigma_space.setValue(float(p.get("sigma_space", 2.0)))
 
     def get_settings(self) -> dict:
         return {
@@ -625,45 +985,25 @@ class DenoiseSettingsDialog(QDialog):
 # Sharpen settings dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
-class SharpenSettingsDialog(QDialog):
-    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Sharpen settings")
-        self.setMinimumWidth(320)
+class SharpenSettingsDialog(OpSettingsDialog):
+    OP = "sharpen"
+    TITLE = "Sharpen settings"
 
-        form = QFormLayout()
-        form.setSpacing(8)
-
+    def _build(self, form: QFormLayout) -> None:
         self._amount = QDoubleSpinBox()
-        self._amount.setRange(0.0, 5.0)
-        self._amount.setSingleStep(0.1)
-        self._amount.setDecimals(2)
-        self._amount.setValue(cfg.get("amount", 0.6))
+        self._amount.setRange(0.0, 5.0); self._amount.setSingleStep(0.1); self._amount.setDecimals(2)
         form.addRow("Amount:", self._amount)
-
         self._radius = QDoubleSpinBox()
-        self._radius.setRange(0.1, 5.0)
-        self._radius.setSingleStep(0.1)
-        self._radius.setDecimals(2)
-        self._radius.setValue(cfg.get("radius", 1.0))
+        self._radius.setRange(0.1, 5.0); self._radius.setSingleStep(0.1); self._radius.setDecimals(2)
         form.addRow("Radius (px):", self._radius)
-
         self._threshold = QDoubleSpinBox()
-        self._threshold.setRange(0.0, 10.0)
-        self._threshold.setSingleStep(0.1)
-        self._threshold.setDecimals(2)
-        self._threshold.setValue(cfg.get("threshold", 1.5))
+        self._threshold.setRange(0.0, 10.0); self._threshold.setSingleStep(0.1); self._threshold.setDecimals(2)
         form.addRow("Threshold (× σ):", self._threshold)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-
-        root = QVBoxLayout(self)
-        root.addLayout(form)
-        root.addWidget(buttons)
+    def _load(self, p: dict) -> None:
+        self._amount.setValue(float(p.get("amount", 0.6)))
+        self._radius.setValue(float(p.get("radius", 1.0)))
+        self._threshold.setValue(float(p.get("threshold", 1.5)))
 
     def get_settings(self) -> dict:
         return {
@@ -677,27 +1017,22 @@ class SharpenSettingsDialog(QDialog):
 # HPPCC settings dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
-class HPPCCSettingsDialog(QDialog):
-    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("HPPCC settings")
-        self.setMinimumWidth(320)
+class HPPCCSettingsDialog(OpSettingsDialog):
+    OP = "hppcc"
+    TITLE = "HPPCC settings"
+    MIN_WIDTH = 360
 
-        form = QFormLayout()
-        form.setSpacing(8)
+    def _build(self, form: QFormLayout) -> None:
+        self._k_regions = QSpinBox(); self._k_regions.setRange(2, 8)
+        self._k_regions.setToolTip("Number of hue regions for the piecewise-linear fit.")
+        form.addRow("Hue regions (k):", self._k_regions)
 
-        self._blend_width = QDoubleSpinBox()
-        self._blend_width.setRange(0.01, 1.0)
-        self._blend_width.setSingleStep(0.05)
-        self._blend_width.setDecimals(2)
-        self._blend_width.setValue(cfg.get("blend_width", 0.15))
-        form.addRow("Blend width:", self._blend_width)
+        self._optimize = QCheckBox("Optimize region boundaries")
+        form.addRow("", self._optimize)
 
         self._region_smoothness = QDoubleSpinBox()
-        self._region_smoothness.setRange(0.0, 1.0)
-        self._region_smoothness.setSingleStep(0.005)
+        self._region_smoothness.setRange(0.0, 1.0); self._region_smoothness.setSingleStep(0.005)
         self._region_smoothness.setDecimals(3)
-        self._region_smoothness.setValue(cfg.get("region_smoothness", 0.0))
         self._region_smoothness.setToolTip(
             "Couples adjacent hue-region matrices during analysis.\n"
             "Higher = smoother hue transitions but flatter colour detail; "
@@ -705,35 +1040,55 @@ class HPPCCSettingsDialog(QDialog):
         )
         form.addRow("Region smoothness:", self._region_smoothness)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        self._use_blending = QCheckBox("Blend across hue-region boundaries")
+        form.addRow("", self._use_blending)
+        self._blend_width = QDoubleSpinBox()
+        self._blend_width.setRange(0.01, 1.0); self._blend_width.setSingleStep(0.05); self._blend_width.setDecimals(2)
+        form.addRow("Blend width:", self._blend_width)
 
-        root = QVBoxLayout(self)
-        root.addLayout(form)
-        root.addWidget(buttons)
+        self._gradient = QCheckBox("Use gradient (Fourier) HPPCC")
+        self._gradient.setToolTip(
+            "Fit a trigonometric-series HPPCC instead of the piecewise-constrained "
+            "model (region count / smoothness are ignored when enabled)."
+        )
+        form.addRow("", self._gradient)
+        self._harmonics = QSpinBox(); self._harmonics.setRange(1, 8)
+        form.addRow("Gradient harmonics:", self._harmonics)
+
+    def _load(self, p: dict) -> None:
+        self._k_regions.setValue(int(p.get("k_regions", 4)))
+        self._optimize.setChecked(bool(p.get("optimize_boundaries", True)))
+        self._region_smoothness.setValue(float(p.get("region_smoothness", 0.0)))
+        self._use_blending.setChecked(bool(p.get("use_blending", True)))
+        self._blend_width.setValue(float(p.get("blend_width", 0.15)))
+        self._gradient.setChecked(bool(p.get("gradient", False)))
+        self._harmonics.setValue(int(p.get("gradient_harmonics", 2)))
 
     def get_settings(self) -> dict:
         return {
-            "blend_width": self._blend_width.value(),
+            "k_regions": self._k_regions.value(),
+            "optimize_boundaries": self._optimize.isChecked(),
             "region_smoothness": self._region_smoothness.value(),
+            "use_blending": self._use_blending.isChecked(),
+            "blend_width": self._blend_width.value(),
+            "gradient": self._gradient.isChecked(),
+            "gradient_harmonics": self._harmonics.value(),
         }
 
 
-class DevignettingSettingsDialog(QDialog):
-    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Devignetting settings")
-        self.setMinimumWidth(360)
+class HPPCCRPCCSettingsDialog(HPPCCSettingsDialog):
+    OP = "hppcc_rpcc"
+    TITLE = "HPPCC+RPCC settings"
 
-        form = QFormLayout()
-        form.setSpacing(8)
 
+class DevignettingSettingsDialog(OpSettingsDialog):
+    OP = "devignetting"
+    TITLE = "Devignetting settings"
+    MIN_WIDTH = 360
+
+    def _build(self, form: QFormLayout) -> None:
         self._method = QComboBox()
         self._method.addItems(["zheng", "goldman", "kim"])
-        self._method.setCurrentText(cfg.get("method", "zheng"))
         self._method.setToolTip(
             "zheng: Zheng et al. (2009), radial consistency (Default)\n"
             "goldman: Goldman (2010), gradient distribution symmetry\n"
@@ -741,34 +1096,21 @@ class DevignettingSettingsDialog(QDialog):
         )
         form.addRow("Method:", self._method)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-
-        root = QVBoxLayout(self)
-        root.addLayout(form)
-        root.addWidget(buttons)
+    def _load(self, p: dict) -> None:
+        self._method.setCurrentText(str(p.get("method", "zheng")))
 
     def get_settings(self) -> dict:
-        return {
-            "method": self._method.currentText(),
-        }
+        return {"method": self._method.currentText()}
 
 
-class UndistortSettingsDialog(QDialog):
-    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Undistort settings")
-        self.setMinimumWidth(360)
+class UndistortSettingsDialog(OpSettingsDialog):
+    OP = "undistort"
+    TITLE = "Undistort settings"
+    MIN_WIDTH = 380
 
-        form = QFormLayout()
-        form.setSpacing(8)
-
+    def _build(self, form: QFormLayout) -> None:
         self._method = QComboBox()
         self._method.addItems(["lensfun", "devernay", "aleman"])
-        self._method.setCurrentText(cfg.get("method", "lensfun"))
         self._method.setToolTip(
             "lensfun: Use Lensfun database (Default)\n"
             "devernay: Devernay and Faugeras (2001)\n"
@@ -776,20 +1118,152 @@ class UndistortSettingsDialog(QDialog):
         )
         form.addRow("Method:", self._method)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        self._check_btn = QPushButton("Check Lensfun DB")
+        self._check_btn.setToolTip("Check whether the loaded RAW's camera/lens is in the Lensfun database.")
+        self._check_btn.clicked.connect(self._check_lensfun)
+        form.addRow("", self._check_btn)
 
-        root = QVBoxLayout(self)
-        root.addLayout(form)
-        root.addWidget(buttons)
+    def _load(self, p: dict) -> None:
+        self._method.setCurrentText(str(p.get("method", "lensfun")))
 
     def get_settings(self) -> dict:
-        return {
-            "method": self._method.currentText(),
-        }
+        return {"method": self._method.currentText()}
+
+    def _check_lensfun(self) -> None:
+        path = (self._raw_path or "").strip()
+        if not path or not Path(path).is_file():
+            QMessageBox.information(self, "Check Lensfun DB", "Please load a valid RAW image first.")
+            return
+        from src.lens import is_lens_in_db
+        found, msg = is_lens_in_db(Path(path))
+        title = "Lensfun DB - Found" if found else "Lensfun DB - Not Found"
+        QMessageBox.information(self, title, msg)
+
+
+class RPCCRidgeSettingsDialog(OpSettingsDialog):
+    OP = "rpcc_ridge"
+    TITLE = "Ridge-RPCC settings"
+
+    def _build(self, form: QFormLayout) -> None:
+        self._lambda = QDoubleSpinBox()
+        self._lambda.setRange(0.0, 1.0); self._lambda.setDecimals(6); self._lambda.setSingleStep(1e-4)
+        self._lambda.setToolTip("Tikhonov (ridge) regularisation strength for the root-polynomial fit.")
+        form.addRow("Ridge lambda:", self._lambda)
+
+    def _load(self, p: dict) -> None:
+        self._lambda.setValue(float(p.get("lambda_ridge", 1e-3)))
+
+    def get_settings(self) -> dict:
+        return {"lambda_ridge": self._lambda.value()}
+
+
+class HLCCSettingsDialog(OpSettingsDialog):
+    OP = "hlcc"
+    TITLE = "HLCC settings"
+
+    def _build(self, form: QFormLayout) -> None:
+        self._k_sectors = QSpinBox(); self._k_sectors.setRange(2, 12)
+        self._k_sectors.setToolTip("Number of hue sectors for the hue-linear fit.")
+        form.addRow("Hue sectors (k):", self._k_sectors)
+
+    def _load(self, p: dict) -> None:
+        self._k_sectors.setValue(int(p.get("k_sectors", 4)))
+
+    def get_settings(self) -> dict:
+        return {"k_sectors": self._k_sectors.value()}
+
+
+class TPSSettingsDialog(OpSettingsDialog):
+    OP = "tps"
+    TITLE = "TPS settings"
+
+    def _build(self, form: QFormLayout) -> None:
+        self._smoothing = QDoubleSpinBox()
+        self._smoothing.setRange(0.0, 10.0); self._smoothing.setDecimals(4); self._smoothing.setSingleStep(0.001)
+        self._smoothing.setToolTip("Thin-plate-spline smoothing (0 = exact interpolation through the patches).")
+        form.addRow("Smoothing:", self._smoothing)
+
+    def _load(self, p: dict) -> None:
+        self._smoothing.setValue(float(p.get("smoothing", 0.0)))
+
+    def get_settings(self) -> dict:
+        return {"smoothing": self._smoothing.value()}
+
+
+class LWCCSettingsDialog(OpSettingsDialog):
+    OP = "lwcc"
+    TITLE = "LWCC settings"
+
+    def _build(self, form: QFormLayout) -> None:
+        self._auto = QCheckBox("Auto bandwidth")
+        self._auto.toggled.connect(lambda on: self._bandwidth.setEnabled(not on))
+        form.addRow("", self._auto)
+        self._bandwidth = QDoubleSpinBox()
+        self._bandwidth.setRange(0.01, 5.0); self._bandwidth.setDecimals(3); self._bandwidth.setSingleStep(0.05)
+        self._bandwidth.setToolTip("Kernel bandwidth for locally-weighted regression. Uncheck Auto to set it.")
+        form.addRow("Bandwidth:", self._bandwidth)
+
+    def _load(self, p: dict) -> None:
+        bw = p.get("bandwidth", None)
+        is_auto = bw in (None, "", "auto")
+        self._auto.setChecked(is_auto)
+        self._bandwidth.setEnabled(not is_auto)
+        self._bandwidth.setValue(0.5 if is_auto else float(bw))
+
+    def get_settings(self) -> dict:
+        if self._auto.isChecked():
+            return {"bandwidth": None}
+        return {"bandwidth": self._bandwidth.value()}
+
+
+class WienerSettingsDialog(OpSettingsDialog):
+    OP = "wiener"
+    TITLE = "Wiener settings"
+
+    def _build(self, form: QFormLayout) -> None:
+        self._snr = QDoubleSpinBox()
+        self._snr.setRange(1.0, 10000.0); self._snr.setDecimals(1); self._snr.setSingleStep(10.0)
+        self._snr.setToolTip("Assumed signal-to-noise ratio for the Wiener-regularised linear fit.")
+        form.addRow("SNR:", self._snr)
+
+    def _load(self, p: dict) -> None:
+        self._snr.setValue(float(p.get("snr", 100.0)))
+
+    def get_settings(self) -> dict:
+        return {"snr": self._snr.value()}
+
+
+class PCASettingsDialog(OpSettingsDialog):
+    OP = "pca"
+    TITLE = "PCA settings"
+
+    def _build(self, form: QFormLayout) -> None:
+        self._n = QSpinBox(); self._n.setRange(1, 3)
+        self._n.setToolTip("Number of PCA components retained for the spectral linear fit.")
+        form.addRow("Components:", self._n)
+
+    def _load(self, p: dict) -> None:
+        self._n.setValue(int(p.get("n_components", 3)))
+
+    def get_settings(self) -> dict:
+        return {"n_components": self._n.value()}
+
+
+# op id -> settings dialog class (only ops with tunable params appear here).
+OP_DIALOGS: dict[str, type] = {
+    "undistort": UndistortSettingsDialog,
+    "devignetting": DevignettingSettingsDialog,
+    "denoise": DenoiseSettingsDialog,
+    "sharpen": SharpenSettingsDialog,
+    "hppcc": HPPCCSettingsDialog,
+    "hppcc_rpcc": HPPCCRPCCSettingsDialog,
+    "rpcc_ridge": RPCCRidgeSettingsDialog,
+    "hlcc": HLCCSettingsDialog,
+    "tps": TPSSettingsDialog,
+    "lwcc": LWCCSettingsDialog,
+    "wiener": WienerSettingsDialog,
+    "pca": PCASettingsDialog,
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -890,11 +1364,12 @@ class AnalyzeTab(QWidget):
         self._roi: tuple[int, int, int, int] | None = None
         self._loader: RawPreviewLoader | None = None
         self._proc: QProcess | None = None
-        self.denoise_args_provider: callable = lambda: ["--no-patch-variance-denoise"]
-        self.sharpen_args_provider: callable = lambda: ["--no-adaptive-sharpen"]
-        self.hppcc_args_provider: callable = lambda: []
-        self.devignetting_args_provider: callable = lambda: ["--no-devignetting"]
-        self.undistort_args_provider: callable = lambda: ["--undistort"]
+        self._out_buf = ""   # line buffer for parsing @@STEP@@/@@PIPELINE@@ markers
+        self._divergences: list[str] = []   # steps that ran differently than planned
+        self._applied_pipeline_text = ""    # formatted summary of what actually ran
+        # Injected by MainWindow; encodes the ordered pipeline plus all
+        # method/param flags (see MainWindow.get_pipeline_args).
+        self.pipeline_args_provider: callable = lambda: []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -955,6 +1430,29 @@ class AnalyzeTab(QWidget):
         lv.addLayout(roi_row)
         hsplit.addWidget(left)
 
+        # Middle-left — draggable operation palette
+        self._palette = OperationPalette()
+        hsplit.addWidget(self._palette)
+
+        # Middle-right — ordered pipeline (drop target) + Clear button
+        pipe_w = QWidget()
+        pipe_v = QVBoxLayout(pipe_w)
+        pipe_v.setContentsMargins(4, 0, 4, 0)
+        pipe_v.setSpacing(4)
+        pipe_v.addWidget(QLabel("<b>Pipeline</b>"))
+        self._pipeline = PipelineList()
+        # The Undistort settings dialog's "Check Lensfun DB" button needs the
+        # currently loaded RAW path.
+        self._pipeline._raw_path_provider = lambda: self._raw_path
+        # Default mirrors prior defaults (undistort on, hppcc_rpcc output);
+        # overridden by restored state when a saved pipeline exists.
+        self._pipeline.set_ops(["undistort", "hppcc_rpcc"])
+        pipe_v.addWidget(self._pipeline, 1)
+        clear_pipe = QPushButton("Clear")
+        clear_pipe.clicked.connect(self._pipeline.clear)
+        pipe_v.addWidget(clear_pipe)
+        hsplit.addWidget(pipe_w)
+
         # Right — "Show developed" checkbox + developed preview
         right = QWidget()
         rv = QVBoxLayout(right)
@@ -973,7 +1471,7 @@ class AnalyzeTab(QWidget):
         self._developed.zoom_changed.connect(self._preview.set_zoom_external)
         self._developed.scroll_changed.connect(self._preview.set_scroll_external)
 
-        hsplit.setSizes([600, 400])
+        hsplit.setSizes([440, 150, 190, 420])
         vsplit.addWidget(hsplit)
 
         # ── Panel 2: parameters + run button ─────────────────────────────
@@ -1008,37 +1506,13 @@ class AnalyzeTab(QWidget):
         opts.addWidget(QLabel("Color space:"))
         self._cs = QComboBox(); self._cs.addItems(["sRGB", "Display-P3"])
         opts.addWidget(self._cs)
-        opts.addSpacing(20)
-        
-        apply_lbl = QLabel("<b>Apply to final image:</b>")
-        apply_lbl.setToolTip("Select which computed model should be used to render the final corrected image.")
-        opts.addWidget(apply_lbl)
-        self._output_method = QComboBox()
-        self._output_method.addItems([
-            "hppcc_rpcc", "hppcc", "baseline", "rpcc", "rpcc_ridge",
-            "hlcc", "tps", "lwcc", "de00_opt", "wiener", "pca"
-        ])
-        opts.addWidget(self._output_method)
         opts.addStretch()
         p2.addLayout(opts)
 
-        pre_row = QHBoxLayout()
-        pre_lbl = QLabel("<b>Pre-processing:</b>")
-        pre_row.addWidget(pre_lbl)
-        self._undistort = QCheckBox("Undistort")
-        self._undistort.setChecked(True)
-        pre_row.addWidget(self._undistort)
-        self._devignetting = QCheckBox("Devignetting")
-        self._devignetting.setChecked(False)
-        pre_row.addWidget(self._devignetting)
-        self._denoise = QCheckBox("Denoise")
-        self._denoise.setChecked(False)    # mirrors ENABLE_PATCH_VARIANCE_DENOISE default
-        pre_row.addWidget(self._denoise)
-        self._sharpen = QCheckBox("Sharpen")
-        self._sharpen.setChecked(False)    # mirrors ENABLE_ADAPTIVE_SHARPEN default
-        pre_row.addWidget(self._sharpen)
-        pre_row.addStretch()
-        p2.addLayout(pre_row)
+        # Pre-processing and correction are now arranged in the visual pipeline
+        # (palette → ordered list above). Method/parameter settings for each op
+        # still live in the menu bar (Undistort/Devignetting/Denoise/Sharpen/
+        # HPPCC → Settings…).
 
         run_row = QHBoxLayout()
         run_row.setSpacing(8)
@@ -1160,8 +1634,19 @@ class AnalyzeTab(QWidget):
                 "Pick a white reference image or uncheck the option.",
             )
             return
+        if not any(op in CORRECTION_OPS for op in self._pipeline.ops()):
+            QMessageBox.warning(
+                self, "Empty pipeline",
+                "Add at least one correction operation to the pipeline before "
+                "running — there is nothing to render otherwise.",
+            )
+            return
         self._log.clear()
         self._developed.clear()
+        self._out_buf = ""
+        self._divergences = []
+        self._applied_pipeline_text = ""
+        self._pipeline.mark_all_pending()
         self._run_btn.setEnabled(False)
         self._set_led_busy()
 
@@ -1174,17 +1659,12 @@ class AnalyzeTab(QWidget):
                 "--process-dir", out,
                 "--output-format", self._fmt.currentText(),
                 "--output-colorspace", self._cs.currentText(),
-                "--output-label", self._output_method.currentText(),
                 "--no-show-detection-preview",
                 "--no-show-developed-image-preview",
             )
 
-            args += self.denoise_args_provider()
-            args += self.sharpen_args_provider()
-            args += self.hppcc_args_provider()
-            args += self.devignetting_args_provider()
-            args += self.undistort_args_provider()
-            
+            args += self.pipeline_args_provider()
+
             if self._white_field.isChecked():
                 args += [
                     "--process-white-field",
@@ -1210,10 +1690,87 @@ class AnalyzeTab(QWidget):
 
     def _on_output(self) -> None:
         raw = self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
-        self._log.insertPlainText(raw)
+        self._out_buf += raw
+        while "\n" in self._out_buf:
+            line, self._out_buf = self._out_buf.split("\n", 1)
+            self._handle_line(line + "\n")
+
+    def _handle_line(self, line: str) -> None:
+        stripped = line.strip()
+        if stripped.startswith("@@STEP@@"):
+            self._apply_step_marker(stripped[len("@@STEP@@"):].strip())
+            return
+        if stripped.startswith("@@PIPELINE@@"):
+            self._apply_pipeline_marker(stripped[len("@@PIPELINE@@"):].strip())
+            return
+        self._log.insertPlainText(line)
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
 
+    def _apply_step_marker(self, payload: str) -> None:
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            return
+        status = str(data.get("status", ""))
+        reason = str(data.get("reason", ""))
+        effective = str(data.get("effective", ""))
+        op = str(data.get("op", "")) or f"step {data.get('index', '?')}"
+        self._pipeline.set_step_status(
+            int(data.get("index", -1)),
+            status,
+            mean=data.get("mean_de00"),
+            median=data.get("median_de00"),
+            reason=reason,
+            effective=effective,
+        )
+        # Track any departure from the planned pipeline so we can warn at the end.
+        if status == "skipped":
+            self._divergences.append(
+                f"• '{op}' was not applied" + (f" — {reason}." if reason else ".")
+            )
+        elif status == "ok" and effective and effective != op:
+            self._divergences.append(
+                f"• '{op}' was substituted with '{effective}'"
+                + (f" — {reason}." if reason else ".")
+            )
+
+    def _apply_pipeline_marker(self, payload: str) -> None:
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            return
+        applied = data.get("applied", [])
+        if not applied:
+            return
+
+        def _fmt_val(v):
+            if isinstance(v, float):
+                return f"{v:g}"
+            return str(v)
+
+        lines = ["Applied pipeline (what was actually used):"]
+        for i, step in enumerate(applied, 1):
+            op = step.get("op", "")
+            eff = step.get("effective", "")
+            name = f"{op} → {eff}" if eff and eff != op else op
+            params = step.get("params") or {}
+            param_txt = ", ".join(f"{k}={_fmt_val(v)}" for k, v in params.items())
+            line = f"  {i}. {name}"
+            if param_txt:
+                line += f"  [{param_txt}]"
+            if step.get("mean_de00") is not None and step.get("median_de00") is not None:
+                line += f"  →  ΔE₀₀ mean {step['mean_de00']:.2f} / median {step['median_de00']:.2f}"
+            if step.get("reason"):
+                line += f"  ({step['reason']})"
+            lines.append(line)
+        self._applied_pipeline_text = "\n".join(lines)
+        self._log.append("\n" + self._applied_pipeline_text)
+
     def _on_done(self, code: int, _) -> None:
+        # Flush any trailing partial line left in the buffer.
+        if self._out_buf:
+            self._handle_line(self._out_buf)
+            self._out_buf = ""
         self._run_btn.setEnabled(True)
         self._set_led_idle()
         if code == 0:
@@ -1234,6 +1791,18 @@ class AnalyzeTab(QWidget):
                     self._developed.set_from_file(str(img_path))
                 else:
                     self._developed.setText("Developed image not found.")
+            # The analysis succeeded but the pipeline ran differently than the
+            # user arranged (steps skipped or models substituted) — make it
+            # obvious instead of silently producing a different result.
+            if self._divergences:
+                message = (
+                    "The analysis completed, but some steps did not run as you "
+                    "arranged them:\n\n"
+                    + "\n".join(self._divergences)
+                )
+                if self._applied_pipeline_text:
+                    message += "\n\n" + self._applied_pipeline_text
+                QMessageBox.warning(self, "Pipeline executed differently than planned", message)
         else:
             log_text = self._log.toPlainText()
             if "No ColorChecker detected" in log_text:
@@ -1511,11 +2080,7 @@ class BatchTab(QWidget):
         self._stopping = False
         # Providers injected by MainWindow so the batch uses the same denoise/
         # sharpen/HPPCC menu state as the Analyze tab.
-        self.denoise_args_provider: callable = lambda: ["--no-patch-variance-denoise"]
-        self.sharpen_args_provider: callable = lambda: ["--no-adaptive-sharpen"]
-        self.hppcc_args_provider: callable = lambda: []
-        self.devignetting_args_provider: callable = lambda: ["--no-devignetting"]
-        self.undistort_args_provider: callable = lambda: ["--undistort"]
+        self.pipeline_args_provider: callable = lambda: []
         self._build_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────
@@ -1827,11 +2392,7 @@ class BatchTab(QWidget):
             "--no-show-detection-preview",
             "--no-show-developed-image-preview",
         )
-        args += self.denoise_args_provider()
-        args += self.sharpen_args_provider()
-        args += self.hppcc_args_provider()
-        args += self.devignetting_args_provider()
-        args += self.undistort_args_provider()
+        args += self.pipeline_args_provider()
 
         self._current_stage = "analyzing"
         self._current_correction = ""
@@ -1970,32 +2531,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("CoCo2l - Color Correction Tool")
-        self.setMinimumSize(1000, 860)
+        self.setMinimumSize(1180, 860)
 
-        self._denoise_cfg: dict = {
-            "method": "wavelet",
-            "strength": 6.0,
-            "diameter": 5,
-            "sigma_space": 2.0,
-        }
-        self._sharpen_cfg: dict = {
-            "amount": 0.6,
-            "radius": 1.0,
-            "threshold": 1.5,
-        }
-        self._hppcc_cfg: dict = {
-            "use_blending": True,
-            "blend_width": 0.15,
-            "region_smoothness": 0.0,
-            "gradient": False,
-        }
-        self._devignetting_cfg: dict = {
-            "method": "zheng",
-        }
-        self._undistort_cfg: dict = {
-            "method": "lensfun",
-        }
-
+        # Per-op settings now live on each pipeline entry (edited via its gear
+        # button), so there are no global per-op config dicts here anymore.
         self._tabs = QTabWidget()
         self._analyze = AnalyzeTab()
         self._process = ProcessTab()
@@ -2006,20 +2545,13 @@ class MainWindow(QMainWindow):
 
         self._analyze.correction_ready.connect(self._on_correction_ready)
 
-        # Denoise/sharpen/HPPCC providers wired into Analyze and Batch (the
-        # analyze step inside batch jobs uses the same menu settings). During
-        # Process the values saved in the correction JSON take priority over
-        # GUI settings, so ProcessTab is not wired.
-        self._analyze.denoise_args_provider = self.get_denoise_args
-        self._analyze.sharpen_args_provider = self.get_sharpen_args
-        self._analyze.hppcc_args_provider = self.get_hppcc_args
-        self._analyze.devignetting_args_provider = self.get_devignetting_args
-        self._analyze.undistort_args_provider = self.get_undistort_args
-        self._batch.denoise_args_provider = self.get_denoise_args
-        self._batch.sharpen_args_provider = self.get_sharpen_args
-        self._batch.hppcc_args_provider = self.get_hppcc_args
-        self._batch.devignetting_args_provider = self.get_devignetting_args
-        self._batch.undistort_args_provider = self.get_undistort_args
+        # The pipeline (ordered ops) plus the per-op method/param menu settings
+        # are encoded together by get_pipeline_args and wired into Analyze and
+        # Batch (the analyze step inside batch jobs uses the same menu settings).
+        # During Process the values saved in the correction JSON take priority
+        # over GUI settings, so ProcessTab is not wired.
+        self._analyze.pipeline_args_provider = self.get_pipeline_args
+        self._batch.pipeline_args_provider = self.get_pipeline_args
 
         self._build_menu()
         self.setCentralWidget(self._tabs)
@@ -2042,11 +2574,6 @@ class MainWindow(QMainWindow):
             "analyze.show_developed": a._show_developed,
             "analyze.format":         a._fmt,
             "analyze.colorspace":     a._cs,
-            "analyze.output_method":  a._output_method,
-            "analyze.denoise":        a._denoise,
-            "analyze.sharpen":        a._sharpen,
-            "analyze.devignetting":   a._devignetting,
-            "analyze.undistort":      a._undistort,
             "analyze.white_field":    a._white_field,
             "analyze.white_field_path": a._white_field_path,
             "process.correction":     p._corr_edit,
@@ -2064,9 +2591,9 @@ class MainWindow(QMainWindow):
     def _persisted_state(self) -> dict:
         widgets = self._persisted_widgets()
         out = {key: _widget_value(w) for key, w in widgets.items()}
-        out["denoise_cfg"] = dict(self._denoise_cfg)
-        out["sharpen_cfg"] = dict(self._sharpen_cfg)
-        out["hppcc_cfg"] = dict(self._hppcc_cfg)
+        # The pipeline (ordered ops + per-instance params) is the single source
+        # of truth for op settings; it is persisted as a list of {op, params}.
+        out["analyze_pipeline"] = self._analyze._pipeline.entries()
         out["batch_rows"] = self._batch.collect_rows()
         return out
 
@@ -2076,20 +2603,11 @@ class MainWindow(QMainWindow):
         for key, widget in self._persisted_widgets().items():
             if key in data:
                 _set_widget_value(widget, data[key])
-        denoise = data.get("denoise_cfg")
-        if isinstance(denoise, dict):
-            self._denoise_cfg.update(denoise)
-        sharpen = data.get("sharpen_cfg")
-        if isinstance(sharpen, dict):
-            self._sharpen_cfg.update(sharpen)
-        hppcc = data.get("hppcc_cfg")
-        if isinstance(hppcc, dict):
-            self._hppcc_cfg.update(hppcc)
-            # Sync the menu action with the restored toggle state.
-            if hasattr(self, "_hppcc_action"):
-                self._hppcc_action.blockSignals(True)
-                self._hppcc_action.setChecked(bool(self._hppcc_cfg.get("use_blending", True)))
-                self._hppcc_action.blockSignals(False)
+        pipeline = data.get("analyze_pipeline")
+        if isinstance(pipeline, list) and pipeline:
+            # set_entries tolerates both the new {op, params} dicts and the
+            # legacy list-of-op-id-strings format.
+            self._analyze._pipeline.set_entries(pipeline)
         batch_rows = data.get("batch_rows")
         if isinstance(batch_rows, list):
             self._batch.restore_rows(batch_rows)
@@ -2101,84 +2619,9 @@ class MainWindow(QMainWindow):
     # ── menu ─────────────────────────────────────────────────────────────
 
     def _build_menu(self) -> None:
+        # All per-op settings now live on the pipeline entries (gear buttons),
+        # so the only menu left is Help.
         mb = self.menuBar()
-        hppcc_menu = mb.addMenu("HPPCC")
-
-        self._hppcc_action = QAction("HPPCC blending", self, checkable=True)
-        self._hppcc_action.setChecked(self._hppcc_cfg["use_blending"])
-        self._hppcc_action.toggled.connect(self._on_hppcc_toggled)
-        hppcc_menu.addAction(self._hppcc_action)
-
-        hppcc_settings_action = QAction("HPPCC settings...", self)
-        hppcc_settings_action.triggered.connect(self._open_hppcc_settings)
-        hppcc_menu.addAction(hppcc_settings_action)
-
-        denoise_menu = mb.addMenu("Denoise")
-
-        self._denoise_action = QAction("Denoise", self, checkable=True)
-        self._denoise_action.setChecked(self._analyze._denoise.isChecked())
-        self._denoise_action.toggled.connect(self._on_menu_denoise_toggled)
-        denoise_menu.addAction(self._denoise_action)
-
-        settings_action = QAction("Denoise settings...", self)
-        settings_action.triggered.connect(self._open_denoise_settings)
-        denoise_menu.addAction(settings_action)
-
-        # Keep menu action and checkbox in sync
-        self._analyze._denoise.toggled.connect(self._on_checkbox_denoise_toggled)
-
-        sharpen_menu = mb.addMenu("Sharpen")
-
-        self._sharpen_action = QAction("Sharpen", self, checkable=True)
-        self._sharpen_action.setChecked(self._analyze._sharpen.isChecked())
-        self._sharpen_action.toggled.connect(self._on_menu_sharpen_toggled)
-        sharpen_menu.addAction(self._sharpen_action)
-
-        sharpen_settings_action = QAction("Sharpen settings...", self)
-        sharpen_settings_action.triggered.connect(self._open_sharpen_settings)
-        sharpen_menu.addAction(sharpen_settings_action)
-
-        self._analyze._sharpen.toggled.connect(self._on_checkbox_sharpen_toggled)
-
-        devignetting_menu = mb.addMenu("Devignetting")
-
-        self._devignetting_action = QAction("Devignetting", self, checkable=True)
-        self._devignetting_action.setChecked(self._analyze._devignetting.isChecked())
-        self._devignetting_action.toggled.connect(self._on_menu_devignetting_toggled)
-        devignetting_menu.addAction(self._devignetting_action)
-
-        devignetting_settings_action = QAction("Settings...", self)
-        devignetting_settings_action.triggered.connect(self._open_devignetting_settings)
-        devignetting_menu.addAction(devignetting_settings_action)
-
-        self._analyze._devignetting.toggled.connect(self._on_checkbox_devignetting_toggled)
-
-        undistort_menu = mb.addMenu("Undistort")
-
-        self._undistort_action = QAction("Undistort", self, checkable=True)
-        self._undistort_action.setChecked(self._analyze._undistort.isChecked())
-        self._undistort_action.toggled.connect(self._on_menu_undistort_toggled)
-        undistort_menu.addAction(self._undistort_action)
-
-        self._check_lensfun_action = QAction("Check Lensfun DB", self)
-        self._check_lensfun_action.triggered.connect(self._check_lensfun_db)
-        self._check_lensfun_action.setEnabled(False)
-        undistort_menu.addAction(self._check_lensfun_action)
-
-        undistort_settings_action = QAction("Settings...", self)
-        undistort_settings_action.triggered.connect(self._open_undistort_settings)
-        undistort_menu.addAction(undistort_settings_action)
-
-        self._analyze._undistort.toggled.connect(self._on_checkbox_undistort_toggled)
-        self._analyze._raw_edit.textChanged.connect(self._update_lensfun_check_state)
-
-        # Expanding spacer so the Help menu lands on the right edge of the bar.
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        spacer_action = QWidgetAction(mb)
-        spacer_action.setDefaultWidget(spacer)
-        mb.addAction(spacer_action)
-
         help_menu = mb.addMenu("Help")
 
         howto_action = QAction("How to", self)
@@ -2197,144 +2640,17 @@ class MainWindow(QMainWindow):
         dlg = AboutDialog(self)
         dlg.exec()
 
-    def _on_menu_denoise_toggled(self, checked: bool) -> None:
-        self._analyze._denoise.blockSignals(True)
-        self._analyze._denoise.setChecked(checked)
-        self._analyze._denoise.blockSignals(False)
+    def get_pipeline_args(self) -> list[str]:
+        """Encode the ordered pipeline with each entry's per-instance params as a
+        single ``--pipeline-spec`` JSON argument.
 
-    def _on_checkbox_denoise_toggled(self, checked: bool) -> None:
-        self._denoise_action.blockSignals(True)
-        self._denoise_action.setChecked(checked)
-        self._denoise_action.blockSignals(False)
-
-    def _open_denoise_settings(self) -> None:
-        dlg = DenoiseSettingsDialog(self._denoise_cfg, self)
-        if dlg.exec():
-            self._denoise_cfg = dlg.get_settings()
-
-    def _on_menu_sharpen_toggled(self, checked: bool) -> None:
-        self._analyze._sharpen.blockSignals(True)
-        self._analyze._sharpen.setChecked(checked)
-        self._analyze._sharpen.blockSignals(False)
-
-    def _on_checkbox_sharpen_toggled(self, checked: bool) -> None:
-        self._sharpen_action.blockSignals(True)
-        self._sharpen_action.setChecked(checked)
-        self._sharpen_action.blockSignals(False)
-
-    def _open_sharpen_settings(self) -> None:
-        dlg = SharpenSettingsDialog(self._sharpen_cfg, self)
-        if dlg.exec():
-            self._sharpen_cfg = dlg.get_settings()
-
-    def _on_hppcc_toggled(self, checked: bool) -> None:
-        self._hppcc_cfg["use_blending"] = bool(checked)
-
-    def _open_hppcc_settings(self) -> None:
-        dlg = HPPCCSettingsDialog(self._hppcc_cfg, self)
-        if dlg.exec():
-            self._hppcc_cfg.update(dlg.get_settings())
-
-    def _on_menu_devignetting_toggled(self, checked: bool) -> None:
-        self._analyze._devignetting.blockSignals(True)
-        self._analyze._devignetting.setChecked(checked)
-        self._analyze._devignetting.blockSignals(False)
-
-    def _on_checkbox_devignetting_toggled(self, checked: bool) -> None:
-        self._devignetting_action.blockSignals(True)
-        self._devignetting_action.setChecked(checked)
-        self._devignetting_action.blockSignals(False)
-
-    def _open_devignetting_settings(self) -> None:
-        dlg = DevignettingSettingsDialog(self._devignetting_cfg, self)
-        if dlg.exec():
-            self._devignetting_cfg = dlg.get_settings()
-
-    def _on_menu_undistort_toggled(self, checked: bool) -> None:
-        self._analyze._undistort.blockSignals(True)
-        self._analyze._undistort.setChecked(checked)
-        self._analyze._undistort.blockSignals(False)
-
-    def _on_checkbox_undistort_toggled(self, checked: bool) -> None:
-        self._undistort_action.blockSignals(True)
-        self._undistort_action.setChecked(checked)
-        self._undistort_action.blockSignals(False)
-
-    def _open_undistort_settings(self) -> None:
-        dlg = UndistortSettingsDialog(self._undistort_cfg, self)
-        if dlg.exec():
-            self._undistort_cfg = dlg.get_settings()
-
-    def _update_lensfun_check_state(self, path: str) -> None:
-        has_file = bool(path.strip()) and Path(path.strip()).is_file()
-        self._check_lensfun_action.setEnabled(has_file)
-
-    def _check_lensfun_db(self) -> None:
-        path = self._analyze._raw_edit.text().strip()
-        if not path or not Path(path).is_file():
-            QMessageBox.information(self, "Check Lensfun DB", "Please select a valid RAW image first.")
-            return
-        from src.lens import is_lens_in_db
-        found, msg = is_lens_in_db(Path(path))
-        title = "Lensfun DB - Found" if found else "Lensfun DB - Not Found"
-        QMessageBox.information(self, title, msg)
-
-    def get_undistort_args(self) -> list[str]:
-        if not self._analyze._undistort.isChecked():
-            return ["--no-undistort"]
-        return [
-            "--undistort",
-            "--undistort-method", self._undistort_cfg["method"],
-        ]
-
-    def get_devignetting_args(self) -> list[str]:
-        if not self._analyze._devignetting.isChecked():
-            return ["--no-devignetting"]
-        return [
-            "--devignetting",
-            "--devignetting-method", self._devignetting_cfg["method"],
-        ]
-
-    def get_denoise_args(self) -> list[str]:
-        if not self._analyze._denoise.isChecked():
-            return ["--no-patch-variance-denoise"]
-        cfg = self._denoise_cfg
-        return [
-            "--patch-variance-denoise",
-            "--denoise-method", cfg["method"],
-            "--denoise-strength", str(cfg["strength"]),
-            "--denoise-diameter", str(cfg["diameter"]),
-            "--denoise-sigma-space", str(cfg["sigma_space"]),
-        ]
-
-    def get_sharpen_args(self) -> list[str]:
-        if not self._analyze._sharpen.isChecked():
-            return ["--no-adaptive-sharpen"]
-        cfg = self._sharpen_cfg
-        return [
-            "--adaptive-sharpen",
-            "--sharpen-amount", str(cfg["amount"]),
-            "--sharpen-radius", str(cfg["radius"]),
-            "--sharpen-threshold", str(cfg["threshold"]),
-        ]
-
-    def get_hppcc_args(self) -> list[str]:
-        cfg = self._hppcc_cfg
-        # Region smoothness affects the fit regardless of blending, so it is
-        # always passed.
-        args = ["--hppcc-region-smoothness", str(cfg.get("region_smoothness", 0.0))]
-        if cfg.get("use_blending", True):
-            args += [
-                "--use-hppcc-blending",
-                "--hppcc-blend-width", str(cfg.get("blend_width", 0.15)),
-            ]
-        else:
-            args += ["--no-use-hppcc-blending"]
-        if cfg.get("gradient", False):
-            args.append("--hppcc-gradient")
-        else:
-            args.append("--no-hppcc-gradient")
-        return args
+        ``QProcess.start(prog, args)`` passes argv as a list (no shell), so the
+        JSON string travels as one element with no quoting concerns. The backend
+        derives op enablement from membership and reads each op's params from the
+        spec.
+        """
+        entries = self._analyze._pipeline.entries()
+        return ["--pipeline-spec", json.dumps(entries)]
 
     # ── slots ─────────────────────────────────────────────────────────────
 
